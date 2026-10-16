@@ -1,0 +1,18 @@
+[Unit]
+Description=Home Assistant TTS announcements over PipeWire
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hifiberry-tts/env
+ExecStart=%h/.local/bin/hifiberry-tts
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

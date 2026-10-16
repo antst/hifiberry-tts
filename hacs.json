@@ -1,0 +1,6 @@
+{
+  "name": "HiFiBerry TTS Bridge",
+  "homeassistant": "2026.10.1",
+  "zip_release": true,
+  "filename": "hifiberry_tts.zip"
+}

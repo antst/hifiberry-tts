@@ -1,0 +1,15 @@
+{
+  "title": "HiFiBerry TTS Bridge",
+  "config": {
+    "step": {"user": {
+      "title": "Connect to the Rust TTS bridge",
+      "description": "Use the bridge HTTP port (8090), and API_TOKEN from its environment file.",
+      "data": {"host": "Host", "port": "HTTP port", "token": "API token", "name": "Name"}
+    }},
+    "error": {
+      "cannot_connect": "Cannot connect. Check host, HTTP port and bridge version (0.3.0+).",
+      "invalid_auth": "Incorrect bridge API token."
+    },
+    "abort": {"already_configured": "This bridge is already configured."}
+  }
+}
