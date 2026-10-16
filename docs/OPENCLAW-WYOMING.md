@@ -12,7 +12,7 @@ Send `{"type":"describe"}` followed by newline. The standard `info` response inc
 {"type":"info","data":{"tts":[{"name":"hifiberry-tts-proxy","installed":true,"supports_synthesize_streaming":false,"voices":[{"name":"sarah-bilingual","languages":["en","ru"],"installed":true}]}]}}
 ```
 
-This is an abbreviated example; real descriptors include attribution and preserve upstream voice metadata. Read **`info.tts[0].voices`** and use the exact voice name, without a `.s2voice` suffix. The bridge refreshes discovery on each `describe`. If upstream is unavailable/unconfigured, `tts` is omitted; speaker discovery still succeeds. There is one proxied TTS program, so `select-program` is unnecessary.
+This is an abbreviated example; real descriptors include attribution and preserve upstream voice metadata. Read **`info.tts[0].voices`** and use the advertised voice name exactly, without modifying it. The bridge refreshes discovery on each `describe`. If upstream is unavailable/unconfigured, `tts` is omitted; speaker discovery still succeeds. There is one proxied TTS program, so `select-program` is unnecessary.
 
 ## Generate and play
 
