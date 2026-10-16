@@ -91,6 +91,6 @@ target:
 
 This uses the bridge's authenticated `POST /v1/cancel` endpoint. It does not depend on a nonstandard Wyoming event. Direct upstream computation cancellation depends on the TTS gateway honoring disconnect; HA owns upstream generation for satellite/URL paths. The standard media-player Stop control also stops audio and clears live PCM, while retaining replay metadata. Cancel discards that metadata as well.
 
-For other text producers, see the [OpenClaw Wyoming subset](docs/OPENCLAW-WYOMING.md): standard discovery, voice catalogue, synthesis and PCM playback, with only Cancel as a custom extension. Satellite cancellation discards the remaining incoming audio while preserving HA's connection.
+For other text producers, see the [Wyoming client protocol](docs/WYOMING-CLIENT.md): standard discovery, voice catalogue, synthesis and PCM playback, with only Cancel as a custom extension. Satellite cancellation discards the remaining incoming audio while preserving HA's connection.
 
 This is a community project, not an official HiFiBerry or Home Assistant integration.

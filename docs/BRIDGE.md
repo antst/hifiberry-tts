@@ -155,4 +155,4 @@ Remove the corresponding HA entries and optional HACS integration. No vendor con
 
 ## Other Wyoming clients
 
-See the [OpenClaw subset specification](OPENCLAW-WYOMING.md) for standard voice discovery through `info.tts`, plain TTS synthesis returning PCM, speaker playback, and the sole custom Cancel event. The proxy advertises streaming text as unsupported; the internal direct-player client negotiates upstream streaming separately.
+See the [Wyoming client protocol](WYOMING-CLIENT.md) for standard voice discovery through `info.tts`, plain TTS synthesis returning PCM, speaker playback, and the sole custom Cancel event. The proxy advertises streaming text as unsupported; the internal direct-player client negotiates upstream streaming separately.
