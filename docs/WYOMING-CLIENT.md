@@ -37,7 +37,7 @@ Content-Type: application/json
 {"text":"Hello.","voice":"<advertised-voice-id>","language":"en"}
 ```
 
-`text` is required. `voice`, `language` and `speaker` are optional strings. Use an advertised voice ID when selecting one; omit these fields to use configured defaults. The client does not send a synthesis-server address.
+`text` is required. `voice`, `language` and `speaker` are optional strings. Use an advertised voice ID when selecting one; omit these fields to use the synthesis service's defaults. General clients use the bridge's configured synthesis service and need not supply its address.
 
 The bridge queues the request and replies:
 
@@ -52,6 +52,12 @@ After receiving this acknowledgement, the client can disconnect. The bridge inde
 
 `202` acknowledges queue admission, not successful synthesis or playback completion. Non-success HTTP responses indicate rejection. This interface has no per-request completion callback; optional global playback/error status is available at authenticated `GET /v1/status`.
 
+## How Home Assistant maps to these cases
+
+With this project's **custom HA media-player integration**, a normal `tts.speak` action uses **case 2**. The integration extracts the message and options, looks up the Wyoming service address and defaults from the action's selected `tts` entity, and sends them to the bridge through HTTP `/v1/speak`. The bridge requests synthesis and plays the returned audio. HA does not receive audio on this path. This is custom integration behavior; it is not a standard Wyoming text-to-speaker command. HA's audio-file cache is bypassed, so `cache: false` has no effect on this direct path.
+
+With HA's built-in Wyoming satellite integration, `assist_satellite.announce` uses **case 1**. HA obtains speech audio using the satellite's selected Assist pipeline, receives that audio, and sends PCM to the bridge. The bridge receives audio rather than the announcement text.
+
 ## Discover available voices
 
 A client that needs voice selection can connect to the Wyoming listener and send:
@@ -60,7 +66,7 @@ A client that needs voice selection can connect to the Wyoming listener and send
 {"type":"describe"}
 ```
 
-Read standard `info.tts[0].voices` from the response. Use each advertised `name` exactly as returned; identifiers are opaque strings. Read advertised languages and speakers for those optional selections. If `tts` is absent, synthesis is unavailable. Clients using configured defaults need not query voices.
+Read standard `info.tts[0].voices` from the response. Use each advertised `name` exactly as returned; identifiers are opaque strings. Read advertised languages and speakers for those optional selections. If `tts` is absent, synthesis is unavailable. Clients using service defaults need not query voices.
 
 ## Cancel either input
 
@@ -80,7 +86,7 @@ Its acknowledgement is:
 
 Cancel globally stops current output, discards buffered audio and replay media, restores attenuated background volumes, and cancels active bridge-owned synthesis requests. It applies to all inputs and clients. Acknowledgements indicate queue admission, not completion.
 
-For case1, stop sending the cancelled audio. To reuse the speaker connection, send `audio-stop` and wait for `played` before the next `audio-start`. Remaining old chunks are discarded through that `audio-stop`; the connection stays open. For case2, no audio cleanup or additional connection is needed from the client.
+For case 1, stop sending the cancelled audio. To reuse the speaker connection, send `audio-stop` and wait for `played` before the next `audio-start`. Remaining old chunks are discarded through that `audio-stop`; the connection stays open. For case 2, no audio cleanup or additional connection is needed from the client.
 
 ## Wyoming connection rules
 
