@@ -136,7 +136,7 @@ pub(super) fn run(
                     session.rate as usize / 100
                 });
                 let volume = f32::from_bits(session.state.volume.load(Ordering::Acquire));
-                for frame in bytes[..frames * 8].chunks_exact_mut(8) {
+                for frame in bytes[..frames * 8].as_chunks_mut::<8>().0 {
                     if session.draining || session.paused {
                         break;
                     }
@@ -160,7 +160,9 @@ pub(super) fn run(
                             break;
                         }
                     };
-                    for (value, destination) in samples.into_iter().zip(frame.chunks_exact_mut(4)) {
+                    for (value, destination) in
+                        samples.into_iter().zip(frame.as_chunks_mut::<4>().0)
+                    {
                         let value = if value.is_finite() {
                             (value * volume).clamp(-1.0, 1.0)
                         } else {
