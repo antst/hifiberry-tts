@@ -155,4 +155,4 @@ Remove the corresponding HA entries and optional HACS integration. No vendor con
 
 ## Other Wyoming clients
 
-See the [Wyoming client protocol](WYOMING-CLIENT.md) for standard voice discovery through `info.tts`, plain TTS synthesis returning PCM, speaker playback, and the sole custom Cancel event. The proxy advertises streaming text as unsupported; the internal direct-player client negotiates upstream streaming separately.
+See [audio and text inputs](WYOMING-CLIENT.md) for the two independent playback paths: Wyoming PCM input and HTTP fire-and-forget text. Standard voice discovery and the custom Wyoming Cancel event are documented there. The separate [Wyoming synthesis service](WYOMING-TTS-PROXY.md) returns PCM to callers; it does not trigger local playback.
