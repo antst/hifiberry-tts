@@ -9,6 +9,7 @@ Download the source archive and `hifiberry-tts-linux-aarch64` executable from th
 ```sh
 sudo apt-get install -y --no-install-recommends libpipewire-0.3-0 pipewire-bin openssl
 pw-dump > /dev/null
+chmod +x /path/to/hifiberry-tts-linux-aarch64
 sh scripts/install-user.sh /path/to/hifiberry-tts-linux-aarch64
 systemctl --user status hifiberry-tts
 ```
