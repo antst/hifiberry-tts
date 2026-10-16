@@ -247,6 +247,16 @@ def main():
                 assert mpd("command_list_ok_begin\nstatus\ncurrentsong\ncommand_list_end").count("list_OK") == 2
             print("PASS: standard MPD authentication, URL load, pause/release duck, speech volume, seek, resume/re-duck, stop and command lists",flush=True)
 
+            api("play_media", {"url": audio_url})
+            wait_for(lambda: api()["state"] == "playing")
+            api("cancel")
+            wait_for(lambda: api()["state"] == "idle")
+            assert not api()["has_media"] and api()["pcm_buffered_ms"] == 0
+            assert approx(gains(node("background-one")), [.33, .22])
+            assert approx(gains(node("background-two")), original["background-two"])
+            assert gains(next(n for n in objects() if n.get("id") == sink["id"])) == sink_gains
+            print("PASS: Cancel purges media and restores both background streams with master unchanged", flush=True)
+
             # Replacement restores before applying ducking again, never compounds.
             api("play_media", {"url": audio_url})
             wait_for(lambda: api()["state"] == "playing")

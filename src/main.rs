@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "fixed"
         };
         s.pcm_buffer_limit_ms = config.pcm_buffer_ms;
+        s.pcm_receive_limit_bytes = config.max_audio_bytes;
     }
     let worker = tokio::spawn(player::run(config.clone(), status.clone(), receiver));
     let (cancel_mpd, cancelled) = watch::channel(false);
@@ -113,6 +114,7 @@ fn router(app: App) -> Router {
         .route("/v1/seek", post(seek))
         .route("/v1/play", post(play))
         .route("/v1/stop", post(stop))
+        .route("/v1/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(16384))
         .layer(middleware::from_fn_with_state(app.clone(), authenticate))
         .with_state(app)
@@ -211,6 +213,10 @@ async fn play(State(app): State<App>) -> Response {
 
 async fn stop(State(app): State<App>) -> Response {
     enqueue(&app, Control::Stop)
+}
+
+async fn cancel(State(app): State<App>) -> Response {
+    enqueue(&app, Control::Cancel)
 }
 
 fn enqueue(app: &App, command: Control) -> Response {
@@ -342,6 +348,15 @@ mod tests {
         assert!(matches!(receiver.recv().await, Some(Control::Pause(true))));
         assert!(matches!(receiver.recv().await, Some(Control::Volume(v)) if v == 0.8));
         assert!(matches!(receiver.recv().await, Some(Control::Seek(v)) if v == 1.5));
+        assert_eq!(
+            router
+                .oneshot(make("/v1/cancel", "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert!(matches!(receiver.recv().await, Some(Control::Cancel)));
     }
 
     #[tokio::test]

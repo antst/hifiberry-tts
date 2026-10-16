@@ -36,7 +36,7 @@ systemctl --user restart hifiberry-tts
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:8090` | Authenticated HTTP API; use `0.0.0.0:8090` for HA on another host. |
 | `MPD_BIND_ADDR` | `127.0.0.1:6601` | MPD-compatible interface; empty disables it. NG's own port 6600 stays separate. |
-| `WYOMING_BIND_ADDR` | `127.0.0.1:10700` | Announcement-only satellite; empty disables it. |
+| `WYOMING_BIND_ADDR` | `127.0.0.1:10700` | Speaker/satellite and plain TTS proxy; empty disables it. |
 | `API_TOKEN` | Generated on install | HTTP bearer token and MPD password. |
 | `WYOMING_TTS_ADDR` | `TTS_HOST:10200` | TTS server for plain/JSON MPD text requests. Normal `tts.speak` through the custom integration supplies the selected engine's address instead. |
 | `TTS_VOICE` | Empty | Default **advertised Wyoming voice ID** for MPD text. |
@@ -45,7 +45,7 @@ systemctl --user restart hifiberry-tts
 | `TTS_VOLUME_LEVEL` | `1.0` | Initial speech amplitude, 0–1; 1 is unity, no preamp/normalization. |
 | `PCM_BUFFERING_MODE` | `fixed` | `fixed` uses a bounded live queue; `adaptive` estimates arrival speed and can wait for completion. See below. |
 | `PCM_PREBUFFER_MS` | `250` | Audio accumulated before startup/recovery. Adaptive mode may increase this target or wait for completion. |
-| `PCM_BUFFER_MS` | `1000` | 10–5000 ms, at least the prebuffer. Fixed mode: queue cap/backpressure. Adaptive mode: decoder read-ahead cap; disk spool has a separate byte cap. |
+| `PCM_BUFFER_MS` | `1000` | 10–5000 ms, at least the prebuffer. Fixed mode: queue cap/backpressure. Adaptive mode: decoded read-ahead cap; raw PCM receive memory is bounded separately. |
 | `FORCE_PROTO` | Empty / `http` / `https` | Force all incoming media URL schemes when explicitly needed. Path, query and non-default port are preserved. |
 | `MEDIA_HOSTS` | Empty / `homeassistant.local,HA_IP` | Exact allowed HTTP(S) hosts; empty allows any reachable host. |
 | `MAX_AUDIO_BYTES` | `20971520` | Download/PCM byte cap. |
@@ -61,13 +61,23 @@ HTTP downloads have a 5-second connection timeout, a configurable 120-second tot
 
 Set `PCM_BUFFERING_MODE=adaptive` in the bridge environment to apply the same buffering policy to direct TTS and satellite PCM. This is optional; `fixed` preserves the earlier queue behavior.
 
-The adaptive receiver writes PCM to a private, unlinked temporary file independently of playback. `MAX_AUDIO_BYTES` bounds the complete spool; `PCM_BUFFER_MS` bounds decoder read-ahead in memory. Reception therefore continues while playback waits, without filling a paused queue and blocking the next phrase upstream. Stop/replacement cancels the receiver and discards its spool.
+The adaptive receiver stores raw PCM in a separate bounded RAM queue, independently of playback. `MAX_AUDIO_BYTES` caps accepted PCM per item, bounding raw receive memory; `PCM_BUFFER_MS` bounds decoded read-ahead. Consumed chunks are released. Reception continues while playback waits or pauses, so a faster-than-real-time producer can finish and close its connection before speech playback ends. Stop/replacement cancels the receiver and immediately discards its queued data, even if the satellite connection still references that PCM stream.
+
+Receive capacity and startup fill are separate. Keeping `PCM_PREBUFFER_MS=250` with the default 20 MiB receive budget permits tens of seconds ahead without waiting to fill that budget. At 44100 Hz, mono, 16-bit, storage is 88200 bytes/second:
+
+| PCM duration | Raw storage |
+| --- | --- |
+| 20 seconds | 1.76MB (1.68MiB) |
+| 30 seconds | 2.65MB (2.52MiB) |
+| 60 seconds | 5.29MB (5.05MiB) |
+
+For RTF 0.606, a 60-second utterance takes roughly 36.4 seconds to generate and can leave about 24 seconds plus startup delay queued near completion. The default budget accommodates that. This refers to raw receive storage; small decoded/network buffers and allocator overhead are additional. Raising receive capacity beyond the actual backlog does not make inference faster.
 
 The rate estimate divides received audio duration by elapsed arrival time, excluding the wait for the first chunk. It begins after at least 250 ms between arrivals, and includes subsequent inference and transport gaps. The startup target grows with observed gaps. If the observed source is below 1.05 times playback speed before speech starts, the receiver waits for the final `audio-stop`. If playback starts and later starves, it pauses once and waits for the complete remaining tail. Completed short clips drain even below the initial threshold.
 
 This avoids repeated **PCM starvation** by accepting a possible long initial wait or one long recovery pause. It cannot prevent unrelated PipeWire xruns, repair missing upstream audio, or predict total speech duration from an early burst. For an unknown-length source below real time, waiting for completion is the conservative fallback. Background ducking begins when output opens, after adaptive startup buffering; it remains applied during an active recovery pause. Pauses and buffering remain subject to the service's time/size limits.
 
-`GET /v1/status` and the custom HA player's attributes expose `pcm_buffering_mode`, `pcm_source_rate` (audio seconds per arrival second), `pcm_target_ms`, `pcm_waiting_for_complete`, queued audio and underruns. The spool can exceed `pcm_buffer_limit_ms` in adaptive mode; that field describes the memory/read-ahead limit.
+`GET /v1/status` and the custom HA player's attributes expose `pcm_buffering_mode`, `pcm_source_rate` (audio seconds per arrival second), `pcm_target_ms`, `pcm_waiting_for_complete`, `pcm_receive_limit_bytes`, queued audio and underruns. Raw receive-ahead can exceed `pcm_buffer_limit_ms` in adaptive mode; that field describes the decoded read-ahead limit.
 
 The policy follows the rate-estimation and completion-fallback principles used in [GStreamer's download buffering](https://gstreamer.freedesktop.org/documentation/application-development/advanced/buffering.html); GStreamer is not a runtime dependency.
 
@@ -104,6 +114,7 @@ These are this project's endpoints, not pre-existing HiFiBerry APIs. All require
 | `POST /v1/play` | Resume/replay a file or re-synthesize the last direct request. |
 | `POST /v1/pause` | `paused`: boolean. |
 | `POST /v1/stop` | Stop/cancel speech and restore background gains. |
+| `POST /v1/cancel` | Stop, immediately discard PCM and cached replay media, close direct TTS streams, and restore background gains. |
 | `POST /v1/volume` | `volume_level`: 0–1, speech only. |
 | `POST /v1/seek` | `position`: seconds, downloaded files only. |
 
@@ -112,6 +123,10 @@ Commands return 202 when queued; poll status for completion/errors. Media URL pa
 ```sh
 sudo journalctl _SYSTEMD_USER_UNIT=hifiberry-tts.service -f
 ```
+
+The HACS integration exposes `/v1/cancel` as a **Cancel speech** button on the same device. Bridge 0.5.0+ is required for that button; it is unavailable against older bridge versions. Ordinary Stop retains replay metadata; Cancel clears it. A new `play_media`/TTS action is required after Cancel. The button cancels any current input path, including a satellite that has sent `audio-start` but no audio yet.
+
+Cancellation closes the direct TTS socket immediately. Releasing upstream GPU work requires the gateway to propagate disconnect to its backend; it is not guaranteed by the speaker alone. For satellite and URL playback, HA owns the upstream TTS request. The satellite connection stays open: cancelled incoming audio is discarded through `audio-stop`, then acknowledged with `played`. This avoids breaking HA while it is still sending. There is no generic cancel-buffer event in the [documented Wyoming speaker protocol](https://github.com/OHF-Voice/wyoming#readme); `synthesize-stop` ends input text and requests final audio, so it must not be used as an abort command.
 
 ## Build and remove
 
@@ -137,3 +152,7 @@ systemctl --user daemon-reload
 ```
 
 Remove the corresponding HA entries and optional HACS integration. No vendor config needs restoring. Backup binaries/environment files created manually during upgrades can be removed separately.
+
+## Other Wyoming clients
+
+See the [OpenClaw subset specification](OPENCLAW-WYOMING.md) for standard voice discovery through `info.tts`, plain TTS synthesis returning PCM, speaker playback, and the sole custom Cancel event. The proxy advertises streaming text as unsupported; the internal direct-player client negotiates upstream streaming separately.

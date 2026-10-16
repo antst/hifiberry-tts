@@ -4,6 +4,7 @@ import contextlib
 import http.server
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -12,8 +13,8 @@ import threading
 import time
 import urllib.request
 
-from pipewire_smoke import command, objects, unused_port, wait_for
-from wyoming_smoke import TtsServer
+from pipewire_smoke import command, node, objects, unused_port, wait_for
+from wyoming_smoke import TtsServer, event, receive
 
 
 def main():
@@ -38,9 +39,10 @@ def main():
                 command("pw-cli", "create-node", "adapter", "{ factory.name = support.null-audio-sink node.name = adaptive-test-sink media.class = Audio/Sink object.linger = true audio.position = [ FL FR ] }")
                 wait_for(lambda: any(n.get("info", {}).get("props", {}).get("node.name") == "adaptive-test-sink" for n in objects()))
                 port = unused_port()
+                satellite_port = unused_port()
                 token = "test-token-at-least-24-characters"
                 env = {**os.environ, "BIND_ADDR": f"127.0.0.1:{port}",
-                       "API_TOKEN": token, "MPD_BIND_ADDR": "", "WYOMING_BIND_ADDR": "",
+                       "API_TOKEN": token, "MPD_BIND_ADDR": "", "WYOMING_BIND_ADDR": f"127.0.0.1:{satellite_port}",
                        "WYOMING_TTS_ADDR": f"127.0.0.1:{tts.server_address[1]}",
                        "PCM_BUFFERING_MODE": "adaptive", "PCM_BUFFER_MS": "1000",
                        "PCM_PREBUFFER_MS": "250", "DUCK_FACTOR": "1"}
@@ -73,10 +75,10 @@ def main():
                 assert not state["last_error"], state
                 assert state["pcm_underruns"] == 0, state
                 assert abs(state["position"] - expected) < .05, (state, expected)
-                print(f"PASS: recorded 14.65s production / {expected:.5f}s PCM plays continuously with zero underruns; reception exceeds RAM window", flush=True)
+                print(f"PASS: recorded 14.65s production / {expected:.5f}s PCM plays continuously with zero underruns; reception exceeds decoded queue window", flush=True)
 
                 # Start fast, then starve once. Reception must keep running while
-                # output waits for the whole remaining tail, despite the RAM cap.
+                # output waits for the whole remaining tail, despite the decoded queue cap.
                 tts.cadence = {"rate": 16000, "channels": 1,
                     "chunks": [[0, 6400], [1.2, 6400], [1.4, 16000]], "complete_at": 1.5}
                 tts.finished.clear()
@@ -111,6 +113,69 @@ def main():
                 wait_for(lambda: api()["state"] == "idle")
                 assert not api()["last_error"], api()
                 print("PASS: a fresh HTTP audio response delayed beyond 20s downloads and plays", flush=True)
+
+                # Startup fill remains250ms even with60s receive-ahead. After
+                # EOF the TTS socket must close while most speech is unplayed.
+                tts.silent = True
+                tts.cadence = {"rate": 44100, "channels": 1,
+                    "chunks": [[0, 88200]] + [[.8, 4410]] * 580, "complete_at": .9}
+                tts.finished.clear()
+                tts.released.clear()
+                api("speak", {"text": "One minute ahead"})
+                wait_for(lambda: api()["state"] == "playing")
+                assert not tts.finished.is_set(), "Waited for full receive buffer before playing"
+                wait_for(lambda: tts.released.is_set())
+                wait_for(lambda: api()["pcm_buffered_ms"] > 55000)
+                before = api()
+                start = time.monotonic()
+                api("cancel")
+                wait_for(lambda: api()["state"] == "idle")
+                state = api()
+                assert time.monotonic() - start < 2, state
+                assert state["pcm_buffered_ms"] == 0 and not state["has_media"], state
+                assert not state["pcm_waiting_for_complete"], state
+                wait_for(lambda: not node("hifiberry-tts"))
+                try:
+                    api("play")
+                    raise AssertionError("Cancelled speech remained replayable")
+                except urllib.error.HTTPError as err:
+                    assert err.code == 409
+                print(f"PASS: {before['pcm_buffered_ms']}ms receive-ahead, early playback, producer TCP released before playback ends, full cancel clears60s queue", flush=True)
+
+                # Cancel while the direct TTS producer is stalled mid-inference.
+                tts.cadence = None
+                tts.cancelled.clear()
+                api("speak", {"text": "cancel"})
+                wait_for(lambda: api()["state"] == "playing")
+                api("cancel")
+                wait_for(lambda: tts.cancelled.is_set())
+                wait_for(lambda: api()["state"] == "idle")
+                assert not api()["has_media"] and api()["pcm_buffered_ms"] == 0
+                print("PASS: cancel closes active direct synthesis TCP while producer is stalled", flush=True)
+
+                # Satellite may be waiting for first audio, or hold bufferedPCM
+                # after audio-stop. Cancel discards the tail without breaking HA TCP.
+                for with_pcm in (False, True):
+                    with socket.create_connection(("127.0.0.1", satellite_port), timeout=3) as connection:
+                        file = connection.makefile("rwb", buffering=0)
+                        event(file, "audio-start", {"rate": 44100, "width": 2, "channels": 1})
+                        event(file, "ping", {"text": "registered"})
+                        assert receive(file)[0]["type"] == "pong"
+                        if with_pcm:
+                            event(file, "audio-chunk", {"rate": 44100, "width": 2, "channels": 1}, bytes(44100 * 2 * 2))
+                            wait_for(lambda: api()["state"] == "playing")
+                        api("cancel")
+                        # Keep sending after cancellation: all old tail data must
+                        # be discarded, and completion must keep HA connected.
+                        event(file, "audio-chunk", {"rate": 44100, "width": 2, "channels": 1}, bytes(44100 * 2))
+                        event(file, "audio-stop")
+                        event(file, "ping", {"text":"after-cancel"})
+                        kinds = set()
+                        while not {"played", "pong"}.issubset(kinds):
+                            kinds.add(receive(file)[0]["type"])
+                        wait_for(lambda: api()["state"] == "idle")
+                        assert api()["pcm_buffered_ms"] == 0 and not api()["has_media"]
+                print("PASS: satellite cancel discards first-PCM/active tails and preserves TCP/played/ping", flush=True)
             except BaseException:
                 log.flush()
                 print((root / "process.log").read_text(errors="replace"), file=sys.stderr)

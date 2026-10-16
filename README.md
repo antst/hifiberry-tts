@@ -12,7 +12,7 @@ Three Home Assistant input paths are available:
 | Audio URLs / ordinary TTS URLs | Built-in MPD, bridge port 6601 | HA-generated URL → Rust decoder → PipeWire |
 | `assist_satellite.announce` | Built-in Wyoming Protocol, bridge port 10700 | TTS → HA/FFmpeg → Rust PCM → PipeWire |
 
-The Pi runs Rust; the Python files run inside HA. **HACS installs the HA integration only. Install the Rust service on the Pi separately.** Requires bridge 0.3.0+; 0.4.0 adds optional adaptive buffering and a configurable download timeout. Tested with HA **2026.10.1**, 64-bit Debian 13 HiFiBerryOS-NG, PipeWire 1.4.2 and WirePlumber 0.5.8. Legacy Buildroot HiFiBerryOS is outside scope.
+The Pi runs Rust; the Python files run inside HA. **HACS installs the HA integration only. Install the Rust service on the Pi separately.** Basic controls require bridge 0.3.0+; receive-ahead in RAM and the Cancel speech button require 0.5.0+. Tested with HA **2026.10.1**, 64-bit Debian 13 HiFiBerryOS-NG, PipeWire 1.4.2 and WirePlumber 0.5.8. Legacy Buildroot HiFiBerryOS is outside scope.
 
 ## Install through HACS
 
@@ -75,8 +75,22 @@ PCM_BUFFERING_MODE=adaptive
 
 A confirmed request-path difference was corrected in 0.3.1: plain `synthesize` and streaming text can activate different server inference/phrase paths. Server traces also show examples of inference slower than playback and gaps between phrases. That can starve any small prebuffer; it does not by itself explain every perceived difference between direct and HA-mediated playback. HA's URL path waits for a complete file; its satellite path has additional FFmpeg/resampling/read-ahead behavior. Compare identical uncached text, voice and request framing before drawing timing conclusions.
 
-Adaptive mode estimates audio arrival speed and grows its startup reserve. A source observed below real time before playback is held until completion. If playback later starves, it waits for the complete remaining speech, allowing at most one PCM starvation/recovery per item. A private temporary spool keeps receiving independently of the playback queue. This does not accelerate inference or prevent unrelated output glitches.
+Adaptive mode estimates audio arrival speed and grows its startup reserve. A source observed below real time before playback is held until completion. If playback later starves, it waits for the complete remaining speech, allowing at most one PCM starvation/recovery per item. A bounded raw PCM queue in RAM keeps receiving independently of playback. Consumed chunks are freed; the TTS connection closes on reception completion while queued speech continues playing. This does not accelerate inference or prevent unrelated output glitches.
 
-`PCM_PREBUFFER_MS` is accumulated audio, not a fixed timer. `PCM_BUFFER_MS` caps the live queue in fixed mode and decoder read-ahead in adaptive mode; `MAX_AUDIO_BYTES` caps the adaptive spool. Status exposes rate, buffering target, completion wait and underruns. See [configuration and tradeoffs](docs/BRIDGE.md#adaptive-pcm-buffering), [known limitations](docs/KNOWN_ISSUES.md) and [test scope](docs/TESTING.md).
+`PCM_PREBUFFER_MS` is accumulated audio, not a fixed timer. `PCM_BUFFER_MS` caps the live queue in fixed mode and decoder read-ahead in adaptive mode. `MAX_AUDIO_BYTES` caps accepted PCM per item and bounds raw receive memory. The default 20 MiB accommodates almost four minutes of 44100 Hz mono PCM16; 30 seconds uses 2.65 MB. Large receive capacity does not require filling it before starting. Status exposes rate, buffering target, completion wait and underruns. See [configuration and tradeoffs](docs/BRIDGE.md#adaptive-pcm-buffering), [known limitations](docs/KNOWN_ISSUES.md) and [test scope](docs/TESTING.md).
+
+## Cancel speech
+
+The HACS integration adds a **Cancel speech** button to the bridge device. It stops current output, discards received PCM and cached replay media, closes direct TTS connections, and restores ducked background gains. It applies to direct TTS, MPD/URL playback and satellite announcements. It also cancels a satellite waiting for its first PCM chunk. Use the actual button entity ID in your HA actions:
+
+```yaml
+action: button.press
+target:
+  entity_id: button.kitchen_audio_cancel_speech
+```
+
+This uses the bridge's authenticated `POST /v1/cancel` endpoint. It does not depend on a nonstandard Wyoming event. Direct upstream computation cancellation depends on the TTS gateway honoring disconnect; HA owns upstream generation for satellite/URL paths. The standard media-player Stop control also stops audio and clears live PCM, while retaining replay metadata. Cancel discards that metadata as well.
+
+For other text producers, see the [OpenClaw Wyoming subset](docs/OPENCLAW-WYOMING.md): standard discovery, voice catalogue, synthesis and PCM playback, with only Cancel as a custom extension. Satellite cancellation discards the remaining incoming audio while preserving HA's connection.
 
 This is a community project, not an official HiFiBerry or Home Assistant integration.

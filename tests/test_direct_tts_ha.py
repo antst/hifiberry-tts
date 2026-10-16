@@ -135,7 +135,17 @@ async def test_normal_tts_speak_delivers_text_selected_server_and_voice_directly
             resolve.assert_awaited_once()
             await call("media_stop")
             await wait_state("idle")
+            # DedicatedHAbutton is registered on the same bridge device and
+            # cancels every input path, including a cached MPD/URL item.
+            await call("media_play")
+            await wait_state("playing")
+            buttons = hass.states.async_entity_ids("button")
+            assert len(buttons) == 1 and hass.states.get(buttons[0]).state != "unavailable"
+            await hass.services.async_call("button", "press", {"entity_id": buttons[0]}, blocking=True)
+            result = await wait_state("idle")
+            assert not result["has_media"] and result["pcm_buffered_ms"] == 0, result
             print("PASS: actual HA tts.speak sends text/server/voice/language/speaker directly to Rust; HA synthesis bypassed; default engine voice, controls and URL fallback verified")
+            print("PASS: actual HAbutton.press cancels output and clears replay media")
         finally:
             async with http.post(f"http://{HOST}:{os.environ['MPD_TEST_HTTP_PORT']}/v1/stop",
                                  headers={"Authorization": "Bearer " + token}):

@@ -388,8 +388,20 @@ impl Pcm {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.discard_buffer();
         self.cancel_notify.notify_waiters();
-        self.close();
+    }
+    fn discard_buffer(&self) {
+        let mut queue = self.inner.lock().unwrap();
+        queue.closed = true;
+        queue.samples = VecDeque::new();
+        // Drop received PCM immediately, even if a satellite connection
+        // still holds an Arc to this PCM stream.
+        queue.adaptive = None;
+    }
+    fn complete(&self) {
+        self.discard_buffer();
+        self.completed.store(true, Ordering::Release);
     }
     pub async fn cancelled(&self) {
         loop {
@@ -461,11 +473,14 @@ impl Output {
                 };
                 if let Err(error) = result {
                     *state.error.lock().unwrap() = Some(error);
+                    if let Some(pcm) = &completed_pcm {
+                        pcm.cancel();
+                    }
+                }
+                if let Some(pcm) = completed_pcm {
+                    pcm.complete();
                 }
                 state.finished.store(true, Ordering::Release);
-                if let Some(pcm) = completed_pcm {
-                    pcm.completed.store(true, Ordering::Release);
-                }
             })
             .map_err(|e| format!("Cannot start audio thread: {e}"))?;
         Ok(Self {
@@ -530,7 +545,9 @@ impl Output {
     pub async fn stop(mut self) {
         let _ = self.sender.send(Command::Stop);
         if let Some(pcm) = &self.pcm {
-            pcm.cancel();
+            if !pcm.completed.load(Ordering::Acquire) {
+                pcm.cancel();
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -541,7 +558,9 @@ impl Drop for Output {
     fn drop(&mut self) {
         let _ = self.sender.send(Command::Stop);
         if let Some(pcm) = &self.pcm {
-            pcm.cancel();
+            if !pcm.completed.load(Ordering::Acquire) {
+                pcm.cancel();
+            }
         }
     }
 }
@@ -741,7 +760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_spool_drains_past_ram_cap_and_has_at_most_one_underrun() {
+    async fn adaptive_receive_ahead_exceeds_decoded_queue_and_has_at_most_one_underrun() {
         let pcm = Pcm::adaptive(16000, 1, 100, 100, 64000).unwrap();
         pcm.push(&[0, 32].repeat(3200)).await.unwrap();
         assert!(pcm.ready());
@@ -765,6 +784,19 @@ mod tests {
         }
         assert_eq!(pcm.frame().unwrap(), PcmFrame::End);
         assert_eq!(pcm.metrics(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_minute_discards_pcm_even_with_a_live_session_reference() {
+        let pcm = Pcm::adaptive(44100, 1, 1000, 250, 20 * 1024 * 1024).unwrap();
+        pcm.push(&vec![0; 60 * 44100 * 2]).await.unwrap();
+        assert_eq!(pcm.metrics().0, 60000);
+        let session = pcm.clone();
+        pcm.cancel();
+        assert_eq!(session.metrics().0, 0);
+        assert!(session.inner.lock().unwrap().adaptive.is_none());
+        assert_eq!(session.frame().unwrap(), PcmFrame::End);
+        assert!(session.push(&[0, 0]).await.is_err());
     }
 
     #[tokio::test]

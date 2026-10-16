@@ -93,6 +93,16 @@ async fn write(writer: &mut OwnedWriteHalf, kind: &str, data: Value) -> io::Resu
     bytes.push(b'\n');
     writer.write_all(&bytes).await
 }
+async fn write_event(writer: &mut OwnedWriteHalf, event: &Event) -> io::Result<()> {
+    let mut header = json!({"type":event.kind,"data":event.data});
+    if !event.payload.is_empty() {
+        header["payload_length"] = json!(event.payload.len());
+    }
+    let mut bytes = serde_json::to_vec(&header)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.write_all(&event.payload).await
+}
 fn format(event: &Event) -> Result<(u32, usize), String> {
     let rate = event.data["rate"]
         .as_u64()
@@ -132,6 +142,144 @@ fn info() -> Value {
         "snd":[{"name":"hifiberry-tts","description":"PipeWire PCM output","installed":true,
           "attribution":{"name":"hifiberry-tts","url":"https://github.com/hifiberry/hifiberry-os"},
           "snd_format":{"rate":22050,"width":2,"channels":1}}]})
+}
+
+async fn describe(config: &Config) -> Value {
+    let mut result = info();
+    if let Ok(mut program) = voice_catalogue(config).await {
+        // Advertising TTS means returning PCM to the caller, never playing it
+        // implicitly. This proxy implements plain synthesis only.
+        program["name"] = json!("hifiberry-tts-proxy");
+        program["description"] = json!("Configured upstream TTS through HiFiBerry");
+        program["supports_synthesize_streaming"] = json!(false);
+        result["tts"] = json!([program]);
+    }
+    result
+}
+
+async fn voice_catalogue(config: &Config) -> Result<Value, String> {
+    let server = config
+        .tts_server
+        .as_ref()
+        .ok_or("WYOMING_TTS_ADDR is not configured")?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let socket = TcpStream::connect(server)
+            .await
+            .map_err(|e| format!("TTS discovery connection failed: {e}"))?;
+        let (reader, mut writer) = socket.into_split();
+        let mut reader = BufReader::new(reader);
+        write(&mut writer, "describe", json!({}))
+            .await
+            .map_err(|e| e.to_string())?;
+        let response = read(&mut reader)
+            .await?
+            .ok_or("TTS discovery disconnected")?;
+        if response.kind != "info" {
+            return Err("TTS discovery did not return info".into());
+        }
+        response
+            .data
+            .get("tts")
+            .and_then(Value::as_array)
+            .and_then(|programs| {
+                programs
+                    .first()
+                    .filter(|p| p.get("installed") != Some(&Value::Bool(false)))
+            })
+            .cloned()
+            .ok_or("TTS server advertised no installed TTS program".into())
+    })
+    .await
+    .map_err(|_| "TTS voice discovery timed out".to_string())?
+}
+
+async fn user_command(event: &Event, sender: &mpsc::Sender<Control>) -> Result<Value, String> {
+    if event.data["name"] != "hifiberry.cancel" {
+        return Err("Unknown bridge user-event".into());
+    }
+    sender
+        .send(Control::Cancel)
+        .await
+        .map_err(|_| "Player is unavailable")?;
+    Ok(json!({"name":"hifiberry.cancel", "data":{"accepted":true}}))
+}
+
+// The reader task keeps partial event reads alive while other branches handle
+// cancellation or upstream output. Dropping a read_exact future mid-event would
+// otherwise corrupt framing when pings and audio arrive concurrently.
+type Incoming = mpsc::Receiver<Result<Option<Event>, String>>;
+struct AbortTask(tokio::task::AbortHandle);
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn proxy_synthesize(
+    event: Event,
+    config: &Config,
+    incoming: &mut Incoming,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    sender: &mpsc::Sender<Control>,
+) -> Result<bool, String> {
+    if event.data["text"].as_str().is_none() {
+        return Err("synthesize requires text".into());
+    }
+    let server = config
+        .tts_server
+        .as_ref()
+        .ok_or("WYOMING_TTS_ADDR is not configured")?;
+    let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(server))
+        .await
+        .map_err(|_| "TTS proxy connection timed out")?
+        .map_err(|e| e.to_string())?;
+    socket.set_nodelay(true).map_err(|e| e.to_string())?;
+    let token = Pcm::new(8000, 1, 10, 0);
+    sender
+        .send(Control::RegisterPcm(Arc::downgrade(&token)))
+        .await
+        .map_err(|_| "Player stopped")?;
+    let (reader, mut upstream) = socket.into_split();
+    let writer_out = writer.clone();
+    let mut task = tokio::spawn(async move {
+        write(&mut upstream, "synthesize", event.data)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(reader);
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(60), read(&mut reader))
+                .await
+                .map_err(|_| "TTS proxy audio stalled")??
+                .ok_or("TTS disconnected without audio-stop")?;
+            let done = matches!(event.kind.as_str(), "audio-stop" | "error");
+            write_event(&mut *writer_out.lock().await, &event)
+                .await
+                .map_err(|e| e.to_string())?;
+            if done {
+                return Ok::<(), String>(());
+            }
+        }
+    });
+    // Always abort the task/socket on client EOF, global Cancel or errors.
+    let abort = AbortTask(task.abort_handle());
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => { drop(abort); return Ok(false); }
+            result = &mut task => { result.map_err(|e| e.to_string())??; return Ok(true); }
+            event = incoming.recv() => {
+                let Some(event) = event.transpose()? else { return Ok(false); };
+                let Some(event) = event else { return Ok(false); };
+                match event.kind.as_str() {
+                    "ping" => write(&mut *writer.lock().await, "pong", event.data).await.map_err(|e| e.to_string())?,
+                    "user-event" => {
+                        let reply = user_command(&event, sender).await?;
+                        write(&mut *writer.lock().await, "user-event", reply).await.map_err(|e| e.to_string())?;
+                    }
+                    _ => return Err("Send one synthesize request at a time".into()),
+                }
+            }
+        }
+    }
 }
 pub async fn serve(
     listener: TcpListener,
@@ -183,24 +331,72 @@ async fn session(
     status: Arc<RwLock<Status>>,
     sender: mpsc::Sender<Control>,
 ) -> Result<(), String> {
+    socket.set_nodelay(true).map_err(|e| e.to_string())?;
     let (reader, writer) = socket.into_split();
-    let mut reader = BufReader::new(reader);
+    let (input, mut incoming) = mpsc::channel(8);
+    let reader_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let result = tokio::time::timeout(Duration::from_secs(90), read(&mut reader))
+                .await
+                .map_err(|_| "Wyoming connection idle timeout".to_string())
+                .and_then(|r| r);
+            let done = !matches!(&result, Ok(Some(_)));
+            if input.send(result).await.is_err() || done {
+                break;
+            }
+        }
+    });
+    let _reader_task = AbortTask(reader_task.abort_handle());
     let writer = Arc::new(Mutex::new(writer));
     let mut heartbeat: Option<Heartbeat> = None;
     let mut active = CancelOnDrop(None);
     let mut started = false;
     let mut bytes = 0;
+    let mut discarding = false;
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(90), read(&mut reader))
-            .await
-            .map_err(|_| "Wyoming connection idle timeout")??;
+        let event = tokio::select! {
+            biased;
+            _ = async {
+                if let Some(pcm) = &active.0 { pcm.cancelled().await; }
+                else { std::future::pending::<()>().await; }
+            }, if !discarding => { discarding = true; continue; }
+            event = incoming.recv() => event.transpose()?.flatten(),
+        };
         let Some(event) = event else {
             return Ok(());
         };
         match event.kind.as_str() {
-            "describe" => write(&mut *writer.lock().await, "info", info())
+            "describe" => write(&mut *writer.lock().await, "info", describe(&config).await)
                 .await
                 .map_err(|e| e.to_string())?,
+            "user-event" => {
+                let (kind, data) = match user_command(&event, &sender).await {
+                    Ok(data) => ("user-event", data),
+                    Err(error) => ("error", json!({"code": "hifiberry-command", "text": error})),
+                };
+                write(&mut *writer.lock().await, kind, data)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "synthesize" => {
+                match proxy_synthesize(event, &config, &mut incoming, writer.clone(), &sender).await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(error) => write(
+                        &mut *writer.lock().await,
+                        "error",
+                        json!({"code":"synthesis", "text":error}),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+                }
+            }
+            "synthesize-start" | "synthesize-chunk" | "synthesize-stop" => {
+                write(&mut *writer.lock().await, "error", json!({"code":"unsupported", "text":"This TTS proxy supports plain synthesize only"}))
+                    .await.map_err(|e| e.to_string())?;
+            }
             "run-satellite" => {
                 write(&mut *writer.lock().await, "satellite-connected", json!({}))
                     .await
@@ -236,8 +432,14 @@ async fn session(
                 if let Some(old) = active.0.take() {
                     old.cancel();
                 }
-                active.0 = Some(new_pcm(rate, channels, &config)?);
+                let pcm = new_pcm(rate, channels, &config)?;
+                sender
+                    .send(Control::RegisterPcm(Arc::downgrade(&pcm)))
+                    .await
+                    .map_err(|_| "Player stopped")?;
+                active.0 = Some(pcm);
                 started = false;
+                discarding = false;
                 bytes = 0;
             }
             "audio-chunk" => {
@@ -245,6 +447,9 @@ async fn session(
                 validate_chunk(&event, pcm)?;
                 bytes += event.payload.len() as u64;
                 limited(bytes, pcm, &config)?;
+                if discarding || pcm.is_cancelled() {
+                    continue;
+                }
                 if !started && !event.payload.is_empty() {
                     let mut settings = config.defaults.clone();
                     settings.volume_level = status.read().await.volume_level;
@@ -254,7 +459,13 @@ async fn session(
                         .map_err(|_| "Player stopped")?;
                     started = true;
                 }
-                pcm.push(&event.payload).await?;
+                if let Err(error) = pcm.push(&event.payload).await {
+                    if pcm.is_cancelled() {
+                        discarding = true;
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
             "audio-stop" => {
                 eprintln!("Wyoming satellite audio-stop: {bytes} PCM bytes received");
@@ -282,7 +493,7 @@ async fn session(
                 }
             }
             "pause-satellite" => {} // HA pipeline pause does not cancel an announcement.
-            "synthesize" | "run-pipeline" | "transcribe" | "detect" => {}
+            "run-pipeline" | "transcribe" | "detect" => {}
             _ => {}
         }
     }
@@ -420,7 +631,9 @@ pub async fn direct(
                                     limited(total, &pcm, &config)?;
                                     pcm.push(&event.payload).await?;
                                 }
-                                "audio-stop" => {
+                                "audio-start" => validate_chunk(&event, &pcm)?,
+                                "audio-stop" if streaming => {}
+                                "audio-stop" | "synthesize-stopped" => {
                                     pcm.close();
                                     return Ok(());
                                 }
@@ -442,7 +655,10 @@ pub async fn direct(
                 });
                 return crate::player::prepare_pcm(pcm, settings, status, max_buffer_wait).await;
             }
-            "audio-stop" => return Err("Wyoming TTS returned no audio".into()),
+            "audio-stop" if streaming => {}
+            "audio-stop" | "synthesize-stopped" => {
+                return Err("Wyoming TTS returned no audio".into())
+            }
             _ => {}
         }
     }

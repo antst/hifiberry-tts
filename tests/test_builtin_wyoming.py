@@ -6,6 +6,9 @@ The HA process needs ffmpeg available in PATH.
 import asyncio
 import os
 import pytest
+from aiohttp import ClientSession
+from wyoming.client import AsyncTcpClient
+from wyoming.info import Describe, Info
 from homeassistant import auth, bootstrap, loader
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
@@ -23,6 +26,12 @@ async def test_builtin_wyoming_satellite_announcement(tmp_path):
     hass.auth=await auth.auth_manager_from_config(hass,[{'type':'homeassistant'}],[])
     entry=None
     try:
+        async with AsyncTcpClient(HOST, int(os.environ['WYOMING_TEST_PORT'])) as client:
+            await client.write_event(Describe().event())
+            description = Info.from_event(await client.read_event())
+            assert description.satellite and description.snd
+            assert description.tts and description.tts[0].voices[0].name == 'test-voice'
+            assert not description.tts[0].supports_synthesize_streaming
         assert await async_setup_component(hass,'homeassistant',{})
         result=await hass.config_entries.flow.async_init('wyoming',context={'source':'user'})
         result=await hass.config_entries.flow.async_configure(result['flow_id'],{'host':HOST,'port':int(os.environ['WYOMING_TEST_PORT'])})
@@ -43,6 +52,35 @@ async def test_builtin_wyoming_satellite_announcement(tmp_path):
         await hass.services.async_call('assist_satellite','announce',{'entity_id':entity,'media_id':os.environ['WYOMING_TEST_AUDIO_URL'],'preannounce':False},blocking=True)
         assert hass.states.get(entity).state=='idle',hass.states.get(entity)
         print('PASS: unmodified HA Wyoming config flow, satellite entity and assist_satellite.announce via FFmpeg/PCM on the real NG device')
+        if os.getenv('MPD_TEST_PASSWORD'):
+            async with ClientSession() as http:
+                base=f"http://{HOST}:{os.environ['MPD_TEST_HTTP_PORT']}/v1/"
+                headers={'Authorization':'Bearer '+os.environ['MPD_TEST_PASSWORD']}
+                async def status():
+                    async with http.get(base+'status',headers=headers) as response:
+                        return await response.json()
+                # Cancel two successive announcements, verifying HA receives
+                # completion and keeps its connection for another announcement.
+                for _ in range(2):
+                    for attempt in range(200):
+                        if hass.states.get(entity).state=='idle':break
+                        await asyncio.sleep(.05)
+                    pending=asyncio.create_task(hass.services.async_call('assist_satellite','announce',{'entity_id':entity,'media_id':os.environ['WYOMING_TEST_AUDIO_URL'],'preannounce':False},blocking=True))
+                    for attempt in range(200):
+                        current=await status()
+                        if current['state']=='playing' and current['pcm_buffered_ms']>10000:break
+                        assert not pending.done(),pending.exception() if pending.done() else current
+                        await asyncio.sleep(.025)
+                    else:raise AssertionError(current)
+                    async with http.post(base+'cancel',headers=headers,json={}) as response:
+                        assert response.status==202
+                    await asyncio.wait_for(pending,5)
+                    for attempt in range(100):
+                        current=await status()
+                        if current['state']=='idle':break
+                        await asyncio.sleep(.025)
+                    assert current['state']=='idle' and current['pcm_buffered_ms']==0 and not current['has_media'],current
+                print('PASS: HA satellite announcements cancel promptly, complete their service call and accept a subsequent announcement')
     finally:
         if entry:await hass.config_entries.async_unload(entry.entry_id)
         await hass.async_stop(force=True)

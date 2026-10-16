@@ -82,7 +82,7 @@ class BridgePlayer(CoordinatorEntity, MediaPlayerEntity):
             "last_error", "duck_warning", "ducked_streams", "pcm_buffered_ms",
             "pcm_underruns", "pcm_prebuffer_ms", "pcm_buffer_limit_ms",
             "pcm_buffering_mode", "pcm_source_rate", "pcm_target_ms",
-            "pcm_waiting_for_complete")}
+            "pcm_waiting_for_complete", "pcm_receive_limit_bytes", "supports_cancel")}
 
     async def _command(self, endpoint, data=None):
         await self.api.request(endpoint, data or {})

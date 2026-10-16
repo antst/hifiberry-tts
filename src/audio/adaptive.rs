@@ -2,13 +2,13 @@
 //! same principles as a download buffer: independent ingestion, rate estimates,
 //! and a conservative completion fallback when remaining duration is unknown.
 use std::{
-    fs::File,
-    os::unix::fs::FileExt,
+    collections::VecDeque,
     time::{Duration, Instant},
 };
 
 pub(super) struct Buffer {
-    file: File,
+    chunks: VecDeque<Vec<u8>>,
+    offset: usize,
     pub written: u64,
     pub loaded: u64,
     pub consumed_frames: u64,
@@ -22,8 +22,12 @@ pub(super) struct Buffer {
 
 impl Buffer {
     pub fn new(max_bytes: u64, prebuffer_frames: usize) -> Result<Self, String> {
+        if max_bytes == 0 {
+            return Err("PCM receive limit must be positive".into());
+        }
         Ok(Self {
-            file: tempfile::tempfile().map_err(|e| format!("Cannot create PCM buffer: {e}"))?,
+            chunks: VecDeque::new(),
+            offset: 0,
             written: 0,
             loaded: 0,
             consumed_frames: 0,
@@ -50,9 +54,14 @@ impl Buffer {
         if length > self.max_bytes {
             return Err("Adaptive PCM buffer exceeds MAX_AUDIO_BYTES".into());
         }
-        self.file
-            .write_all_at(bytes, self.written)
-            .map_err(|e| format!("Cannot spool PCM: {e}"))?;
+        if !bytes.is_empty() {
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| "Cannot allocate PCM receive buffer")?;
+            chunk.extend_from_slice(bytes);
+            self.chunks.push_back(chunk);
+        }
         self.written = length;
         let frames = self.written / (channels as u64 * 2);
         let (first_at, first_frames) = *self.first.get_or_insert((now, frames));
@@ -87,10 +96,20 @@ impl Buffer {
     }
     pub fn read(&mut self, frames: usize, channels: usize) -> Result<Vec<u8>, String> {
         let bytes = (frames * channels * 2).min((self.written - self.loaded) as usize);
-        let mut result = vec![0; bytes];
-        self.file
-            .read_exact_at(&mut result, self.loaded)
-            .map_err(|e| format!("Cannot read PCM buffer: {e}"))?;
+        let mut result = Vec::with_capacity(bytes);
+        while result.len() < bytes {
+            let chunk = self
+                .chunks
+                .front()
+                .ok_or("PCM receive buffer is incomplete")?;
+            let count = (bytes - result.len()).min(chunk.len() - self.offset);
+            result.extend_from_slice(&chunk[self.offset..self.offset + count]);
+            self.offset += count;
+            if self.offset == chunk.len() {
+                self.chunks.pop_front();
+                self.offset = 0;
+            }
+        }
         self.loaded += bytes as u64;
         Ok(result)
     }
@@ -128,7 +147,7 @@ mod tests {
         assert!(buffer.target_frames >= 8000);
     }
     #[test]
-    fn fast_source_keeps_streaming_and_spool_enforces_a_byte_limit() {
+    fn fast_source_keeps_streaming_and_receive_queue_enforces_a_byte_limit() {
         let now = Instant::now();
         let mut buffer = Buffer::new(40000, 4000).unwrap();
         buffer.write(&vec![0; 3200], 16000, 1, false, now).unwrap();

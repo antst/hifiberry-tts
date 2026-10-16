@@ -10,6 +10,8 @@ Rust tests cover protected NG stages, URL/auth validation, server selection, nat
 
 Adaptive tests replay a second captured arrival schedule: 4.13315 seconds of PCM produced over 14.648 seconds in 43 chunks. Only chunk sizes/timing are retained in the repository, without recorded speech, text, addresses or logs. Both the queue test and a real private PipeWire playback test wait for completion and then drain all samples with zero PCM underruns. A separate initially fast source starves once, continues receiving beyond the RAM window, then drains its complete tail with exactly one underrun. Another HTTP test holds a fresh audio response open for 20.5 seconds before providing audio, verifying the configurable download deadline.
 
+Receive-ahead/cancel regression tests send60 seconds of PCM from a fast fake producer. Playback starts before reception completes, more than 55 seconds queue ahead, and the producer observes TCP EOF before playback finishes. Cancel discards the queue, removes output, clears replay eligibility, and closes direct TTS streams and discards satellite tails even during first-audio wait. Queue tests retain an external PCM reference to verify Cancel still frees stored data; a completed prepare-task race is covered as well. HA tests press the real `button.press` action and cancel successive satellite announcements without disconnecting. No real inference requests are used for these checks.
+
 Run local checks:
 
 ```sh
@@ -28,3 +30,5 @@ dbus-run-session -- python3 tests/adaptive_smoke.py target/release/hifiberry-tts
 **Use an isolated container/audio session**, not a production PipeWire session: the test starts its own graph and generators. The runtime does not use mpv or Python.
 
 The three HA tests require Python 3.14, HA 2026.10.1, pytest/pytest-asyncio and the integrations' dependencies. Their module docstrings describe environment variables; they skip without explicit test-device settings. Run only against a **temporary silent candidate**, never a player's live production ports. HACS and hassfest validation run in GitHub Actions. A passing protocol test does not establish glitch-free live inference; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+Wyoming proxy checks cover standard `info.tts` voice discovery, plain synthesis without implicit local playback, binary PCM and `data_length` framing, concurrent ping, successive requests, and upstream disconnect cancellation. The proxy advertises no streaming-text support.

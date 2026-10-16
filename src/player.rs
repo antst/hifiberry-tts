@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::{
     error::Error as _,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc, Weak},
     time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
@@ -40,6 +40,8 @@ pub struct Status {
     pub pcm_source_rate: Option<f64>,
     pub pcm_target_ms: u64,
     pub pcm_waiting_for_complete: bool,
+    pub pcm_receive_limit_bytes: u64,
+    pub supports_cancel: bool,
 }
 
 impl Default for Status {
@@ -65,15 +67,19 @@ impl Default for Status {
             pcm_source_rate: None,
             pcm_target_ms: 250,
             pcm_waiting_for_complete: false,
+            pcm_receive_limit_bytes: 20 * 1024 * 1024,
+            supports_cancel: true,
         }
     }
 }
 
 pub enum Control {
     Load(Url, Settings),
+    RegisterPcm(Weak<Pcm>),
     Pcm(Arc<Pcm>, Settings),
     Play,
     Stop,
+    Cancel,
     Pause(bool),
     Volume(f64),
     Seek(f64),
@@ -114,12 +120,17 @@ pub async fn run(
     let mut cached: Option<Cached> = None;
     let mut last_direct: Option<(Url, Settings)> = None;
     let mut running: Option<Running> = None;
+    let mut incoming: Vec<Weak<Pcm>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
 
     loop {
         tokio::select! {
             command = receiver.recv() => {
                 match command {
+                    Some(Control::RegisterPcm(pcm)) => {
+                        incoming.retain(|p| p.upgrade().is_some_and(|p| !p.completed.load(Ordering::Acquire) && !p.is_cancelled()));
+                        incoming.push(pcm);
+                    }
                     Some(Control::Load(url, settings)) => {
                         cancel_download(&mut pending).await;
                         finish(&config, &status, &mut running).await;
@@ -149,6 +160,9 @@ pub async fn run(
                         }
                     }
                     Some(Control::Pcm(pcm, mut settings)) => {
+                        // Cancellation may overtake an already queued first
+                        // chunk. That old stream must never restart output.
+                        if pcm.is_cancelled() { continue; }
                         cancel_download(&mut pending).await;
                         finish(&config, &status, &mut running).await;
                         cached = None;
@@ -181,10 +195,21 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(Control::Stop) => {
+                    Some(command @ (Control::Stop | Control::Cancel)) => {
+                        for pcm in incoming.drain(..).filter_map(|p| p.upgrade()) {
+                            if !pcm.completed.load(Ordering::Acquire) { pcm.cancel(); }
+                        }
                         cancel_download(&mut pending).await;
                         finish(&config, &status, &mut running).await;
-                        let mut s = status.write().await; s.state = "idle"; s.has_media = cached.is_some() || last_direct.is_some();
+                        let purge = matches!(command, Control::Cancel);
+                        if purge { cached = None; last_direct = None; }
+                        let mut s = status.write().await;
+                        s.state = "idle";
+                        s.has_media = cached.is_some() || last_direct.is_some();
+                        s.pcm_buffered_ms = 0;
+                        s.pcm_waiting_for_complete = false;
+                        s.pcm_source_rate = None;
+                        if purge { s.position = 0.0; s.duration = None; s.last_error = None; }
                     }
                     Some(Control::Pause(paused)) => {
                         if let Some(player) = running.as_mut() {
@@ -322,7 +347,11 @@ pub async fn prepare_pcm(
 async fn cancel_download(pending: &mut Option<JoinHandle<Result<Prepared, String>>>) {
     if let Some(task) = pending.take() {
         task.abort();
-        let _ = task.await;
+        // An already completed prepare task still owns its result. Abort does
+        // nothing in that case; explicitly cancel its PCM before dropping it.
+        if let Ok(Ok(Prepared::Pcm(pcm, _))) = task.await {
+            pcm.cancel();
+        }
     }
 }
 
@@ -537,6 +566,8 @@ async fn finish(config: &Config, status: &RwLock<Status>, running: &mut Option<R
         let mut s = status.write().await;
         s.ducked_streams = 0;
         s.duck_warning = warnings(&messages);
+        s.pcm_buffered_ms = 0;
+        s.pcm_waiting_for_complete = false;
     }
 }
 
@@ -551,6 +582,31 @@ fn warnings(messages: &[String]) -> Option<String> {
 #[cfg(test)]
 mod download_tests {
     use super::*;
+    #[tokio::test]
+    async fn cancel_discards_an_already_prepared_pcm_before_output_starts() {
+        let pcm = Pcm::adaptive(16000, 1, 1000, 250, 64000).unwrap();
+        pcm.push(&vec![0; 32000]).await.unwrap();
+        let retained = pcm.clone();
+        let task = tokio::spawn(async move {
+            Ok(Prepared::Pcm(
+                pcm,
+                Settings {
+                    volume_level: 1.0,
+                    duck_factor: 1.0,
+                    duck_targets: vec![],
+                },
+            ))
+        });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut pending = Some(task);
+        cancel_download(&mut pending).await;
+        assert!(pending.is_none());
+        assert!(retained.is_cancelled());
+        assert_eq!(retained.metrics().0, 0);
+    }
+
     #[tokio::test]
     async fn connection_error_has_endpoint_and_cause_but_no_signed_url() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

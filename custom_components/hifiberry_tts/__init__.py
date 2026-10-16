@@ -7,7 +7,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import BridgeApi, BridgeAuthError, BridgeError
 from .const import CONF_TOKEN, DOMAIN
 
-PLATFORMS = [Platform.MEDIA_PLAYER]
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.BUTTON]
 
 
 async def async_setup_entry(hass, entry):
