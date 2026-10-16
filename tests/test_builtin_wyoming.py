@@ -31,6 +31,7 @@ async def test_builtin_wyoming_satellite_announcement(tmp_path):
             description = Info.from_event(await client.read_event())
             assert description.satellite and description.snd
             assert description.tts and description.tts[0].voices[0].name == 'test-voice'
+            assert description.tts[0].voices[0].description == 'Calm narration — спокойная речь.'
             assert not description.tts[0].supports_synthesize_streaming
         assert await async_setup_component(hass,'homeassistant',{})
         result=await hass.config_entries.flow.async_init('wyoming',context={'source':'user'})

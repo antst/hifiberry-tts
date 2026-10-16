@@ -66,7 +66,11 @@ A client that needs voice selection can connect to the Wyoming listener and send
 {"type":"describe"}
 ```
 
-Read standard `info.tts[0].voices` from the response. Use each advertised `name` exactly as returned; identifiers are opaque strings. Read advertised languages and speakers for those optional selections. If `tts` is absent, synthesis is unavailable. Clients using service defaults need not query voices.
+Read standard `info.tts[0].voices` from the response. Use each advertised `name` exactly as returned; identifiers are opaque strings.
+
+Each voice's optional `description` is forwarded unchanged for display or voice selection, alongside its languages, speakers, attribution, version and any other advertised voice metadata. Descriptions are human-readable text; use `name` as the identifier when requesting speech. Read advertised languages and speakers for those optional selections.
+
+If `tts` is absent, synthesis is unavailable. Clients using service defaults need not query voices.
 
 ## Cancel either input
 

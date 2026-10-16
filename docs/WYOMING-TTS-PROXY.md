@@ -10,7 +10,7 @@ Send one plain request:
 {"type":"synthesize","data":{"text":"Hello.","voice":{"name":"<advertised-voice-id>","language":"en"},"text_format":"text"}}
 ```
 
-`text` is required. Standard optional voice fields are `name`, `language` and `speaker`; omitted fields use synthesis-service defaults. Treat advertised voice identifiers as opaque strings.
+`text` is required. Standard optional voice fields are `name`, `language` and `speaker`; omitted fields use synthesis-service defaults. Treat advertised voice identifiers as opaque strings. Complete voice descriptors, including optional `description`, are forwarded unchanged by `describe`.
 
 Receive `audio-start`, one or more `audio-chunk` events with binary PCM, and `audio-stop`. Errors use standard `error`. Send one request at a time; sequential requests on the same connection are supported. Streaming-text events `synthesize-start/chunk/stop` are unsupported by this service. Closing the connection abandons its synthesis request.
 

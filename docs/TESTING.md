@@ -32,3 +32,10 @@ dbus-run-session -- python3 tests/adaptive_smoke.py target/release/hifiberry-tts
 The three HA tests require Python 3.14, HA 2026.10.1, pytest/pytest-asyncio and the integrations' dependencies. Their module docstrings describe environment variables; they skip without explicit test-device settings. Run only against a **temporary silent candidate**, never a player's live production ports. HACS and hassfest validation run in GitHub Actions. A passing protocol test does not establish glitch-free live inference; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 Wyoming proxy checks cover standard `info.tts` voice discovery, plain synthesis without implicit local playback, binary PCM and `data_length` framing, concurrent ping, successive requests, and upstream disconnect cancellation. The proxy advertises no streaming-text support.
+
+The discovery-only regression requires a built bridge and Python 3, with no PipeWire daemon or TTS model. It verifies complete voice descriptors, Unicode descriptions, refreshed metadata and missing optional descriptions, without any synthesis requests. It runs in CI:
+
+```sh
+cargo build --locked
+python3 tests/wyoming_discovery.py target/debug/hifiberry-tts
+```

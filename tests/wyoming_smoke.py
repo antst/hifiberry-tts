@@ -34,6 +34,11 @@ class TtsServer(socketserver.ThreadingTCPServer):
         self.requests = []
         self.modes = []
         self.streaming = True
+        self.voices = [{"name": "test-voice", "installed": True,
+                        "languages": ["en", "ru"],
+                        "description": "Calm narration — спокойная речь.",
+                        "version": "1.0",
+                        "attribution": {"name": "Test", "url": "https://example.org"}}]
         self.cadence = None
         self.silent = False
         self.peers = []
@@ -51,9 +56,7 @@ class TtsServer(socketserver.ThreadingTCPServer):
                             "name": "Test Wyoming TTS", "installed": True,
                             "supports_synthesize_streaming": server.streaming,
                             "attribution": {"name": "Test", "url": "https://example.org"},
-                            "voices": [{"name": "test-voice", "installed": True,
-                                        "languages": ["en", "ru"],
-                                        "attribution": {"name": "Test", "url": "https://example.org"}}],
+                            "voices": server.voices,
                         }]})
                         # HA describes and disconnects; the bridge describes
                         # and synthesizes on the same connection.
@@ -199,7 +202,7 @@ def exercise(api, node, gains, original, wait_for, tts, wyoming_port, mpd_port, 
         assert "hifiberry" not in info["data"], info
         program = info["data"]["tts"][0]
         assert not program["supports_synthesize_streaming"], info
-        assert program["voices"][0]["name"] == "test-voice", info
+        assert program["voices"] == tts.voices, info
         before = len(tts.requests)
         # Exercise data_length framing as well as binary payload transport.
         data = {"text": "Proxy test", "voice": {"name": "test-voice", "language": "ru", "speaker": "2"}, "text_format": "text"}

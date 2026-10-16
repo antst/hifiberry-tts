@@ -34,3 +34,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Wyoming discovery metadata
+        run: |
+          cargo build --locked
+          python3 tests/wyoming_discovery.py target/debug/hifiberry-tts
