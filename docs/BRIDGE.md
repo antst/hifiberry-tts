@@ -42,17 +42,33 @@ systemctl --user restart hifiberry-tts
 | `DUCK_TARGETS` | `*` | Current running playback source streams, or exact process names separated by commas. |
 | `DUCK_FACTOR` | `0.25` | Multiplier of background linear amplitude; about −12 dB. `1` disables ducking. |
 | `TTS_VOLUME_LEVEL` | `1.0` | Initial speech amplitude, 0–1; 1 is unity, no preamp/normalization. |
-| `PCM_PREBUFFER_MS` | `250` | PCM accumulated before startup and after starvation; 0 starts immediately. |
-| `PCM_BUFFER_MS` | `1000` | Queue cap/backpressure, 10–5000 ms, at least the prebuffer. It is not an extra fixed delay. |
+| `PCM_BUFFERING_MODE` | `fixed` | `fixed` uses a bounded live queue; `adaptive` estimates arrival speed and can wait for completion. See below. |
+| `PCM_PREBUFFER_MS` | `250` | Audio accumulated before startup/recovery. Adaptive mode may increase this target or wait for completion. |
+| `PCM_BUFFER_MS` | `1000` | 10–5000 ms, at least the prebuffer. Fixed mode: queue cap/backpressure. Adaptive mode: decoder read-ahead cap; disk spool has a separate byte cap. |
 | `FORCE_PROTO` | Empty / `http` / `https` | Force all incoming media URL schemes when explicitly needed. Path, query and non-default port are preserved. |
 | `MEDIA_HOSTS` | Empty / `homeassistant.local,HA_IP` | Exact allowed HTTP(S) hosts; empty allows any reachable host. |
 | `MAX_AUDIO_BYTES` | `20971520` | Download/PCM byte cap. |
 | `MAX_PLAY_SECONDS` | `300` | Playback wall-clock limit, including pauses. |
+| `HTTP_DOWNLOAD_TIMEOUT_SECONDS` | `120` | Whole HTTP audio download, including fresh HA TTS generation. Must be positive. |
 | `PIPEWIRE_TARGET` | Empty | Optional existing `node.name`; empty follows NG's current default. |
 
 The supplied install example binds listeners to LAN interfaces. HTTP/MPD use the token, but plain HTTP and MPD do not encrypt it. Wyoming has no authentication/encryption. Use a trusted LAN or restrict access to HA. HiFiBerry's nginx authentication does not protect these separate listeners.
 
-HTTP downloads have a 5-second connection timeout, 20-second total timeout and no redirects. Self-signed/private-CA HTTPS needs appropriate trust/proxy support; this build uses public certificate roots. `FORCE_PROTO=http` is an explicit scheme override, not an automatic TLS downgrade.
+HTTP downloads have a 5-second connection timeout, a configurable 120-second total timeout and no redirects. Earlier versions used a hardcoded 20-second total limit, which could expire while HA was still generating speech. Self-signed/private-CA HTTPS needs appropriate trust/proxy support; this build uses public certificate roots. `FORCE_PROTO=http` is an explicit scheme override, not an automatic TLS downgrade.
+
+## Adaptive PCM buffering
+
+Set `PCM_BUFFERING_MODE=adaptive` in the bridge environment to apply the same buffering policy to direct TTS and satellite PCM. This is optional; `fixed` preserves the earlier queue behavior.
+
+The adaptive receiver writes PCM to a private, unlinked temporary file independently of playback. `MAX_AUDIO_BYTES` bounds the complete spool; `PCM_BUFFER_MS` bounds decoder read-ahead in memory. Reception therefore continues while playback waits, without filling a paused queue and blocking the next phrase upstream. Stop/replacement cancels the receiver and discards its spool.
+
+The rate estimate divides received audio duration by elapsed arrival time, excluding the wait for the first chunk. It begins after at least 250 ms between arrivals, and includes subsequent inference and transport gaps. The startup target grows with observed gaps. If the observed source is below 1.05 times playback speed before speech starts, the receiver waits for the final `audio-stop`. If playback starts and later starves, it pauses once and waits for the complete remaining tail. Completed short clips drain even below the initial threshold.
+
+This avoids repeated **PCM starvation** by accepting a possible long initial wait or one long recovery pause. It cannot prevent unrelated PipeWire xruns, repair missing upstream audio, or predict total speech duration from an early burst. For an unknown-length source below real time, waiting for completion is the conservative fallback. Background ducking begins when output opens, after adaptive startup buffering; it remains applied during an active recovery pause. Pauses and buffering remain subject to the service's time/size limits.
+
+`GET /v1/status` and the custom HA player's attributes expose `pcm_buffering_mode`, `pcm_source_rate` (audio seconds per arrival second), `pcm_target_ms`, `pcm_waiting_for_complete`, queued audio and underruns. The spool can exceed `pcm_buffer_limit_ms` in adaptive mode; that field describes the memory/read-ahead limit.
+
+The policy follows the rate-estimation and completion-fallback principles used in [GStreamer's download buffering](https://gstreamer.freedesktop.org/documentation/application-development/advanced/buffering.html); GStreamer is not a runtime dependency.
 
 ## Home Assistant alternatives without a custom integration
 

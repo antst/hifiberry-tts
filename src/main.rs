@@ -55,6 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut s = status.write().await;
         s.volume_level = config.defaults.volume_level;
         s.pcm_prebuffer_ms = config.pcm_prebuffer_ms;
+        s.pcm_buffering_mode = if config.pcm_adaptive {
+            "adaptive"
+        } else {
+            "fixed"
+        };
         s.pcm_buffer_limit_ms = config.pcm_buffer_ms;
     }
     let worker = tokio::spawn(player::run(config.clone(), status.clone(), receiver));
@@ -258,11 +263,13 @@ mod tests {
                     media_hosts: vec!["ha.local".into()],
                     max_audio_bytes: 1024,
                     max_play_time: Duration::from_secs(10),
+                    download_timeout: Duration::from_secs(120),
                     wyoming_bind: None,
                     tts_server: None,
                     tts_voice: None,
                     pcm_buffer_ms: 1000,
                     pcm_prebuffer_ms: 250,
+                    pcm_adaptive: false,
                     pw_dump: "pw-dump".into(),
                     pw_cli: "pw-cli".into(),
                     audio_device: None,

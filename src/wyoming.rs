@@ -236,12 +236,7 @@ async fn session(
                 if let Some(old) = active.0.take() {
                     old.cancel();
                 }
-                active.0 = Some(Pcm::new(
-                    rate,
-                    channels,
-                    config.pcm_buffer_ms,
-                    config.pcm_prebuffer_ms,
-                ));
+                active.0 = Some(new_pcm(rate, channels, &config)?);
                 started = false;
                 bytes = 0;
             }
@@ -295,7 +290,7 @@ async fn session(
 
 pub async fn direct(
     config: &Config,
-    _status: &RwLock<Status>,
+    status: &RwLock<Status>,
     url: Url,
     settings: Settings,
 ) -> Result<Prepared, String> {
@@ -386,18 +381,14 @@ pub async fn direct(
             "error" => return Err("Wyoming TTS server reported a synthesis error".into()),
             "audio-start" => {
                 let (rate, channels) = format(&event)?;
-                pcm = Some(Pcm::new(
-                    rate,
-                    channels,
-                    config.pcm_buffer_ms,
-                    config.pcm_prebuffer_ms,
-                ));
+                pcm = Some(new_pcm(rate, channels, config)?);
             }
             "audio-chunk" if !event.payload.is_empty() => {
                 let pcm = pcm.ok_or("Wyoming TTS omitted audio-start")?;
                 validate_chunk(&event, &pcm)?;
                 limited(event.payload.len() as u64, &pcm, config)?;
                 let weak = Arc::downgrade(&pcm);
+                let max_buffer_wait = config.max_play_time;
                 let config = config.clone();
                 let first_bytes = event.payload.len() as u64;
                 tokio::spawn(async move {
@@ -449,11 +440,30 @@ pub async fn direct(
                         }
                     }
                 });
-                return Ok(Prepared::Pcm(pcm, settings));
+                return crate::player::prepare_pcm(pcm, settings, status, max_buffer_wait).await;
             }
             "audio-stop" => return Err("Wyoming TTS returned no audio".into()),
             _ => {}
         }
+    }
+}
+
+fn new_pcm(rate: u32, channels: usize, config: &Config) -> Result<Arc<Pcm>, String> {
+    if config.pcm_adaptive {
+        Pcm::adaptive(
+            rate,
+            channels,
+            config.pcm_buffer_ms,
+            config.pcm_prebuffer_ms,
+            config.max_audio_bytes,
+        )
+    } else {
+        Ok(Pcm::new(
+            rate,
+            channels,
+            config.pcm_buffer_ms,
+            config.pcm_prebuffer_ms,
+        ))
     }
 }
 

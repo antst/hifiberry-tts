@@ -12,7 +12,7 @@ Three Home Assistant input paths are available:
 | Audio URLs / ordinary TTS URLs | Built-in MPD, bridge port 6601 | HA-generated URL → Rust decoder → PipeWire |
 | `assist_satellite.announce` | Built-in Wyoming Protocol, bridge port 10700 | TTS → HA/FFmpeg → Rust PCM → PipeWire |
 
-The Pi runs Rust; the Python files run inside HA. **HACS installs the HA integration only. Install the Rust service on the Pi separately.** Requires bridge 0.3.0+; 0.3.1 is recommended to match HA's streaming text protocol. Tested with HA **2026.10.1**, 64-bit Debian 13 HiFiBerryOS-NG, PipeWire 1.4.2 and WirePlumber 0.5.8. Legacy Buildroot HiFiBerryOS is outside scope.
+The Pi runs Rust; the Python files run inside HA. **HACS installs the HA integration only. Install the Rust service on the Pi separately.** Requires bridge 0.3.0+; 0.4.0 adds optional adaptive buffering and a configurable download timeout. Tested with HA **2026.10.1**, 64-bit Debian 13 HiFiBerryOS-NG, PipeWire 1.4.2 and WirePlumber 0.5.8. Legacy Buildroot HiFiBerryOS is outside scope.
 
 ## Install through HACS
 
@@ -63,16 +63,20 @@ DUCK_FACTOR=0.25
 TTS_VOLUME_LEVEL=1.0
 PCM_PREBUFFER_MS=250
 PCM_BUFFER_MS=1000
+# Optional for bursty/slow live PCM:
+PCM_BUFFERING_MODE=adaptive
 ```
 
 `DUCK_TARGETS=*` selects current running source streams; a comma-separated list selects process names. Shared EQ/RIAA and sink/master controls are excluded. New streams appearing after speech starts are not automatically ducked. A hard crash can leave an attenuated stream; graceful stop/restart restores gains while preserving intervening user changes.
 
 ## Streaming status
 
-**Direct streaming hiccups are under investigation. Larger buffers have not been established as a fix.** The initial real-audio tests establish mixing and protocol compatibility, not uninterrupted playback from every live TTS engine.
+**Adaptive buffering trades startup delay for continuous playback when synthesis is slow.** Enable it with `PCM_BUFFERING_MODE=adaptive`; the default `fixed` retains the earlier bounded live queue.
 
 A confirmed request-path difference was corrected in 0.3.1: plain `synthesize` and streaming text can activate different server inference/phrase paths. Server traces also show examples of inference slower than playback and gaps between phrases. That can starve any small prebuffer; it does not by itself explain every perceived difference between direct and HA-mediated playback. HA's URL path waits for a complete file; its satellite path has additional FFmpeg/resampling/read-ahead behavior. Compare identical uncached text, voice and request framing before drawing timing conclusions.
 
-`PCM_PREBUFFER_MS` is audio accumulated before start/recovery, not a fixed timer; `PCM_BUFFER_MS` caps the queue. Status exposes `pcm_underruns` and queued milliseconds. No finite small buffer can compensate indefinitely for synthesis slower than real time. See [known limitations](docs/KNOWN_ISSUES.md) and [test scope](docs/TESTING.md).
+Adaptive mode estimates audio arrival speed and grows its startup reserve. A source observed below real time before playback is held until completion. If playback later starves, it waits for the complete remaining speech, allowing at most one PCM starvation/recovery per item. A private temporary spool keeps receiving independently of the playback queue. This does not accelerate inference or prevent unrelated output glitches.
+
+`PCM_PREBUFFER_MS` is accumulated audio, not a fixed timer. `PCM_BUFFER_MS` caps the live queue in fixed mode and decoder read-ahead in adaptive mode; `MAX_AUDIO_BYTES` caps the adaptive spool. Status exposes rate, buffering target, completion wait and underruns. See [configuration and tradeoffs](docs/BRIDGE.md#adaptive-pcm-buffering), [known limitations](docs/KNOWN_ISSUES.md) and [test scope](docs/TESTING.md).
 
 This is a community project, not an official HiFiBerry or Home Assistant integration.

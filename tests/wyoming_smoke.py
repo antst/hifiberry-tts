@@ -34,6 +34,7 @@ class TtsServer(socketserver.ThreadingTCPServer):
         self.requests = []
         self.modes = []
         self.streaming = True
+        self.cadence = None
         self.peers = []
         self.finished = threading.Event()
         self.cancelled = threading.Event()
@@ -73,6 +74,24 @@ class TtsServer(socketserver.ThreadingTCPServer):
                     server.modes.append(mode)
                     server.peers.append(self.client_address[0])
                     server.finished.clear()
+                    if server.cadence is not None:
+                        cadence = server.cadence
+                        rate = cadence["rate"]
+                        fmt = {"rate": rate, "width": 2, "channels": 1}
+                        total = sum(frames for _, frames in cadence["chunks"])
+                        audio = b"".join(struct.pack("<h", int(4000 * math.sin(2 * math.pi * 880 * i / rate))) for i in range(total))
+                        event(self.wfile, "audio-start", fmt)
+                        started = time.monotonic()
+                        offset = 0
+                        for arrival, frames in cadence["chunks"]:
+                            time.sleep(max(0, started + arrival - time.monotonic()))
+                            end = offset + frames * 2
+                            event(self.wfile, "audio-chunk", fmt, audio[offset:end])
+                            offset = end
+                        time.sleep(max(0, started + cadence["complete_at"] - time.monotonic()))
+                        event(self.wfile, "audio-stop")
+                        server.finished.set()
+                        return
                     fmt = {"rate": 22050, "width": 2, "channels": 1}
                     audio = b"".join(struct.pack("<h", int(4000 * math.sin(2 * math.pi * 880 * i / 22050))) for i in range(22050 * 2))
                     if os.getenv("TTS_FAKE_SILENT"):

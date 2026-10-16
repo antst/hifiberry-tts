@@ -8,6 +8,8 @@ An isolated Home Assistant 2026.10.1 instance exercised three real config-entry/
 
 Rust tests cover protected NG stages, URL/auth validation, server selection, native decoding/seek, bounded PCM, prebuffer/recovery, short tails, cancellation, and capability negotiation. A trace-driven test feeds two-phrase cadence (4.226 seconds of PCM over 14.321 seconds) to the queue: no samples are lost, but a 1500 ms prebuffer still starves, as expected from the producer's rate.
 
+Adaptive tests replay a second captured arrival schedule: 4.13315 seconds of PCM produced over 14.648 seconds in 43 chunks. Only chunk sizes/timing are retained in the repository, without recorded speech, text, addresses or logs. Both the queue test and a real private PipeWire playback test wait for completion and then drain all samples with zero PCM underruns. A separate initially fast source starves once, continues receiving beyond the RAM window, then drains its complete tail with exactly one underrun. Another HTTP test holds a fresh audio response open for 20.5 seconds before providing audio, verifying the configurable download deadline.
+
 Run local checks:
 
 ```sh
@@ -20,6 +22,7 @@ Linux checks require the build dependencies in [BRIDGE.md](BRIDGE.md). The priva
 
 ```sh
 dbus-run-session -- python3 tests/pipewire_smoke.py target/release/hifiberry-tts
+dbus-run-session -- python3 tests/adaptive_smoke.py target/release/hifiberry-tts
 ```
 
 **Use an isolated container/audio session**, not a production PipeWire session: the test starts its own graph and generators. The runtime does not use mpv or Python.

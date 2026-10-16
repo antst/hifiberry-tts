@@ -9,7 +9,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use symphonia::core::{
     audio::SampleBuffer,
@@ -22,6 +22,7 @@ use symphonia::core::{
     units::{Time, TimeBase},
 };
 
+mod adaptive;
 #[cfg(target_os = "linux")]
 mod output;
 
@@ -191,6 +192,7 @@ struct PcmQueue {
     closed: bool,
     waiting: bool,
     played: bool,
+    adaptive: Option<adaptive::Buffer>,
 }
 #[derive(Debug, PartialEq)]
 pub(super) enum PcmFrame {
@@ -209,6 +211,7 @@ impl Pcm {
                 closed: false,
                 waiting: true,
                 played: false,
+                adaptive: None,
             }),
             capacity: rate as usize * buffer_ms as usize / 1000,
             prebuffer: rate as usize * prebuffer_ms as usize / 1000,
@@ -219,10 +222,63 @@ impl Pcm {
             cancel_notify: tokio::sync::Notify::new(),
         })
     }
+    pub fn adaptive(
+        rate: u32,
+        channels: usize,
+        buffer_ms: u32,
+        prebuffer_ms: u32,
+        max_bytes: u64,
+    ) -> Result<Arc<Self>, String> {
+        let mut pcm = Self::new(rate, channels, buffer_ms, prebuffer_ms);
+        let this = Arc::get_mut(&mut pcm).unwrap();
+        this.inner.get_mut().unwrap().adaptive =
+            Some(adaptive::Buffer::new(max_bytes, this.prebuffer)?);
+        Ok(pcm)
+    }
+    pub fn is_adaptive(&self) -> bool {
+        self.inner.lock().unwrap().adaptive.is_some()
+    }
+    pub fn ready(&self) -> bool {
+        let queue = self.inner.lock().unwrap();
+        if queue.closed || self.is_cancelled() {
+            return true;
+        }
+        if let Some(a) = &queue.adaptive {
+            !a.wait_for_complete && a.buffered_frames(self.channels) >= a.target_frames.max(1)
+        } else {
+            queue.samples.len() >= self.prebuffer.max(1)
+        }
+    }
+    pub fn adaptive_stats(&self) -> (Option<f64>, u64, bool) {
+        let queue = self.inner.lock().unwrap();
+        queue.adaptive.as_ref().map_or(
+            (None, self.prebuffer as u64 * 1000 / self.rate as u64, false),
+            |a| {
+                (
+                    a.source_rate,
+                    a.target_frames as u64 * 1000 / self.rate as u64,
+                    a.wait_for_complete && !queue.closed,
+                )
+            },
+        )
+    }
     pub async fn push(&self, bytes: &[u8]) -> Result<(), String> {
         let stride = self.channels * 2;
         if !bytes.len().is_multiple_of(stride) {
             return Err("PCM chunk is not frame aligned".into());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut queue = self.inner.lock().unwrap();
+            if queue.closed || self.is_cancelled() || self.completed.load(Ordering::Acquire) {
+                return Err("Announcement playback was stopped".into());
+            }
+            let played = queue.played;
+            if let Some(a) = queue.adaptive.as_mut() {
+                return a.write(bytes, self.rate, self.channels, played, Instant::now());
+            }
         }
         for part in bytes.chunks((self.rate as usize / 100).max(1) * stride) {
             loop {
@@ -254,12 +310,39 @@ impl Pcm {
     pub(super) fn frame(&self) -> Result<PcmFrame, String> {
         let mut queue = self.inner.lock().unwrap();
         let ended = queue.closed || self.is_cancelled();
-        if queue.waiting && !ended && queue.samples.len() < self.prebuffer.max(1) {
+        let available = queue
+            .adaptive
+            .as_ref()
+            .map_or(queue.samples.len(), |a| a.buffered_frames(self.channels));
+        let (target, until_end) = queue
+            .adaptive
+            .as_ref()
+            .map_or((self.prebuffer, false), |a| {
+                (a.target_frames, a.wait_for_complete)
+            });
+        if queue.waiting && !ended && (until_end || available < target.max(1)) {
             return Ok(PcmFrame::Pending);
         }
         queue.waiting = false;
+        if queue.samples.is_empty() {
+            if let Some(a) = queue.adaptive.as_mut() {
+                let bytes = a.read(
+                    (self.rate as usize / 100).max(1).min(self.capacity),
+                    self.channels,
+                )?;
+                for frame in bytes.chunks_exact(self.channels * 2) {
+                    let left = i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32768.0;
+                    let n = (self.channels - 1) * 2;
+                    let right = i16::from_le_bytes([frame[n], frame[n + 1]]) as f32 / 32768.0;
+                    queue.samples.push_back([left, right]);
+                }
+            }
+        }
         if let Some(frame) = queue.samples.pop_front() {
             queue.played = true;
+            if let Some(a) = queue.adaptive.as_mut() {
+                a.consumed_frames += 1;
+            }
             return Ok(PcmFrame::Sample(frame));
         }
         if ended {
@@ -270,17 +353,29 @@ impl Pcm {
         }
         if queue.played {
             let count = self.underruns.fetch_add(1, Ordering::AcqRel) + 1;
-            eprintln!(
-                "PCM underrun {count}; waiting for {} ms of audio",
-                self.prebuffer * 1000 / self.rate as usize
-            );
+            if let Some(a) = queue.adaptive.as_mut() {
+                a.wait_for_complete = true;
+                eprintln!(
+                    "Adaptive PCM underrun {count}; buffering remaining speech to completion"
+                );
+            } else {
+                eprintln!(
+                    "PCM underrun {count}; waiting for {} ms of audio",
+                    self.prebuffer * 1000 / self.rate as usize
+                );
+            }
         }
         queue.waiting = true;
         Ok(PcmFrame::Pending)
     }
     pub fn metrics(&self) -> (u64, u64) {
+        let queue = self.inner.lock().unwrap();
+        let frames = queue
+            .adaptive
+            .as_ref()
+            .map_or(queue.samples.len(), |a| a.buffered_frames(self.channels));
         (
-            self.inner.lock().unwrap().samples.len() as u64 * 1000 / self.rate as u64,
+            frames as u64 * 1000 / self.rate as u64,
             self.underruns.load(Ordering::Acquire),
         )
     }
@@ -394,6 +489,11 @@ impl Output {
     }
     pub fn metrics(&self) -> (u64, u64) {
         self.pcm.as_ref().map_or((0, 0), |p| p.metrics())
+    }
+    pub fn adaptive_stats(&self) -> (Option<f64>, u64, bool) {
+        self.pcm
+            .as_ref()
+            .map_or((None, 0, false), |p| p.adaptive_stats())
     }
     pub fn buffering(&self) -> bool {
         self.shared.buffering.load(Ordering::Acquire)
@@ -592,6 +692,104 @@ mod tests {
             pcm.metrics().1 > 0,
             "This measured source cannot sustain real-time output"
         );
+    }
+
+    #[tokio::test]
+    async fn recorded_slow_cadence_waits_for_completion_then_drains_without_starvation() {
+        let trace: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/slow-tts-cadence.json")).unwrap();
+        let rate = trace["rate"].as_u64().unwrap();
+        let pcm = Pcm::adaptive(rate as u32, 1, 1000, 250, 1024 * 1024).unwrap();
+        let origin = Instant::now();
+        let mut clock = 0;
+        let mut submitted = 0;
+        for chunk in trace["chunks"].as_array().unwrap() {
+            let seconds = chunk[0].as_f64().unwrap();
+            let frames = chunk[1].as_u64().unwrap() as usize;
+            let next = (seconds * rate as f64) as u64;
+            for _ in clock..next {
+                assert_eq!(pcm.frame().unwrap(), PcmFrame::Pending);
+            }
+            clock = next;
+            let mut queue = pcm.inner.lock().unwrap();
+            queue
+                .adaptive
+                .as_mut()
+                .unwrap()
+                .write(
+                    &vec![0; frames * 2],
+                    rate as u32,
+                    1,
+                    false,
+                    origin + Duration::from_secs_f64(seconds),
+                )
+                .unwrap();
+            submitted += frames;
+        }
+        assert!(pcm.adaptive_stats().2);
+        assert!(
+            pcm.metrics().0 > 4000,
+            "Reception must exceed the RAM window"
+        );
+        assert!(!pcm.ready());
+        pcm.close();
+        for _ in 0..submitted {
+            assert_eq!(pcm.frame().unwrap(), PcmFrame::Sample([0.0, 0.0]));
+        }
+        assert_eq!(pcm.frame().unwrap(), PcmFrame::End);
+        assert_eq!(pcm.metrics(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn adaptive_spool_drains_past_ram_cap_and_has_at_most_one_underrun() {
+        let pcm = Pcm::adaptive(16000, 1, 100, 100, 64000).unwrap();
+        pcm.push(&[0, 32].repeat(3200)).await.unwrap();
+        assert!(pcm.ready());
+        for _ in 0..3200 {
+            assert_eq!(pcm.frame().unwrap(), PcmFrame::Sample([0.25, 0.25]));
+        }
+        assert_eq!(pcm.frame().unwrap(), PcmFrame::Pending);
+        assert_eq!(pcm.metrics().1, 1);
+        // Reception must continue while output waits for completion: no queue
+        // backpressure deadlock, despite 1500ms exceeding the 100ms RAM window.
+        tokio::time::timeout(Duration::from_millis(100), pcm.push(&[0, 64].repeat(24000)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!pcm.ready());
+        assert!(pcm.adaptive_stats().2);
+        assert_eq!(pcm.frame().unwrap(), PcmFrame::Pending);
+        pcm.close();
+        for _ in 0..24000 {
+            assert_eq!(pcm.frame().unwrap(), PcmFrame::Sample([0.5, 0.5]));
+        }
+        assert_eq!(pcm.frame().unwrap(), PcmFrame::End);
+        assert_eq!(pcm.metrics(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_adaptive_startup_closes_upstream_pcm() {
+        let pcm = Pcm::adaptive(16000, 1, 1000, 250, 64000).unwrap();
+        pcm.push(&vec![0; 3200]).await.unwrap();
+        let held = pcm.clone();
+        let task = tokio::spawn(async move {
+            let status = tokio::sync::RwLock::new(crate::player::Status::default());
+            crate::player::prepare_pcm(
+                held,
+                crate::config::Settings {
+                    volume_level: 1.0,
+                    duck_factor: 1.0,
+                    duck_targets: vec!["*".into()],
+                },
+                &status,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        task.abort();
+        let _ = task.await;
+        assert!(pcm.is_cancelled());
     }
 
     #[tokio::test]

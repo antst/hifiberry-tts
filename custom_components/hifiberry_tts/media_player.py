@@ -80,7 +80,9 @@ class BridgePlayer(CoordinatorEntity, MediaPlayerEntity):
     def extra_state_attributes(self):
         return {key: self.coordinator.data.get(key) for key in (
             "last_error", "duck_warning", "ducked_streams", "pcm_buffered_ms",
-            "pcm_underruns", "pcm_prebuffer_ms", "pcm_buffer_limit_ms")}
+            "pcm_underruns", "pcm_prebuffer_ms", "pcm_buffer_limit_ms",
+            "pcm_buffering_mode", "pcm_source_rate", "pcm_target_ms",
+            "pcm_waiting_for_complete")}
 
     async def _command(self, endpoint, data=None):
         await self.api.request(endpoint, data or {})

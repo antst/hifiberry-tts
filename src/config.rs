@@ -18,11 +18,13 @@ pub struct Config {
     pub tts_voice: Option<String>,
     pub pcm_buffer_ms: u32,
     pub pcm_prebuffer_ms: u32,
+    pub pcm_adaptive: bool,
     pub token: String,
     pub defaults: Settings,
     pub media_hosts: Vec<String>,
     pub max_audio_bytes: u64,
     pub max_play_time: Duration,
+    pub download_timeout: Duration,
     pub pw_dump: String,
     pub pw_cli: String,
     pub audio_device: Option<String>,
@@ -60,7 +62,10 @@ impl Config {
         let seconds: u64 = read("MAX_PLAY_SECONDS", "300")
             .parse()
             .map_err(|_| "Invalid MAX_PLAY_SECONDS")?;
-        if max_audio_bytes == 0 || seconds == 0 {
+        let download_seconds: u64 = read("HTTP_DOWNLOAD_TIMEOUT_SECONDS", "120")
+            .parse()
+            .map_err(|_| "Invalid HTTP_DOWNLOAD_TIMEOUT_SECONDS")?;
+        if max_audio_bytes == 0 || seconds == 0 || download_seconds == 0 {
             return Err("Size and time limits must be positive".into());
         }
         let pcm_buffer_ms: u32 = read("PCM_BUFFER_MS", "1000")
@@ -77,6 +82,11 @@ impl Config {
         Ok(Self {
             pcm_buffer_ms,
             pcm_prebuffer_ms,
+            pcm_adaptive: match read("PCM_BUFFERING_MODE", "fixed").as_str() {
+                "fixed" => false,
+                "adaptive" => true,
+                _ => return Err("PCM_BUFFERING_MODE must be fixed or adaptive".into()),
+            },
             bind: read("BIND_ADDR", "127.0.0.1:8090")
                 .parse()
                 .map_err(|_| "Invalid BIND_ADDR")?,
@@ -98,6 +108,7 @@ impl Config {
                 .collect(),
             max_audio_bytes,
             max_play_time: Duration::from_secs(seconds),
+            download_timeout: Duration::from_secs(download_seconds),
             pw_dump: read("PW_DUMP_BIN", "/usr/bin/pw-dump"),
             pw_cli: read("PW_CLI_BIN", "/usr/bin/pw-cli"),
             audio_device: env::var("PIPEWIRE_TARGET").ok().filter(|s| !s.is_empty()),

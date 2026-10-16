@@ -36,6 +36,10 @@ pub struct Status {
     pub pcm_underruns: u64,
     pub pcm_prebuffer_ms: u32,
     pub pcm_buffer_limit_ms: u32,
+    pub pcm_buffering_mode: &'static str,
+    pub pcm_source_rate: Option<f64>,
+    pub pcm_target_ms: u64,
+    pub pcm_waiting_for_complete: bool,
 }
 
 impl Default for Status {
@@ -57,6 +61,10 @@ impl Default for Status {
             pcm_underruns: 0,
             pcm_prebuffer_ms: 250,
             pcm_buffer_limit_ms: 1000,
+            pcm_buffering_mode: "fixed",
+            pcm_source_rate: None,
+            pcm_target_ms: 250,
+            pcm_waiting_for_complete: false,
         }
     }
 }
@@ -97,7 +105,7 @@ pub async fn run(
 ) {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
+        .timeout(config.download_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
@@ -146,7 +154,14 @@ pub async fn run(
                         cached = None;
                         last_direct = None;
                         settings.volume_level = status.read().await.volume_level;
-                        start_source(&config, &status, Source::Pcm(pcm), settings, &mut running).await;
+                        if pcm.is_adaptive() {
+                            status.write().await.state = "buffering";
+                            let status = status.clone();
+                            let timeout = config.max_play_time;
+                            pending = Some(tokio::spawn(async move { prepare_pcm(pcm, settings, &status, timeout).await }));
+                        } else {
+                            start_source(&config, &status, Source::Pcm(pcm), settings, &mut running).await;
+                        }
                     }
                     Some(Control::Play) => {
                         if let Some(player) = running.as_mut() {
@@ -251,11 +266,57 @@ pub async fn run(
                     s.position = player.output.position();
                     s.duration = player.output.duration();
                     (s.pcm_buffered_ms, s.pcm_underruns) = player.output.metrics();
+                    (s.pcm_source_rate, s.pcm_target_ms, s.pcm_waiting_for_complete) = player.output.adaptive_stats();
                     if player.output.started() && !player.paused { s.state = if player.output.buffering() { "buffering" } else { "playing" }; }
                 }
             }
         }
     }
+}
+
+/// Keep reception independent of playout while adaptive startup buffers. The
+/// guard closes upstream promptly when an in-flight prepare task is cancelled.
+pub async fn prepare_pcm(
+    pcm: Arc<Pcm>,
+    settings: Settings,
+    status: &RwLock<Status>,
+    timeout: Duration,
+) -> Result<Prepared, String> {
+    struct Guard(Option<Arc<Pcm>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(pcm) = &self.0 {
+                pcm.cancel();
+            }
+        }
+    }
+    let mut guard = Guard(Some(pcm));
+    let pcm = guard.0.as_ref().unwrap();
+    if pcm.is_adaptive() {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut s = status.write().await;
+                (s.pcm_buffered_ms, s.pcm_underruns) = pcm.metrics();
+                (
+                    s.pcm_source_rate,
+                    s.pcm_target_ms,
+                    s.pcm_waiting_for_complete,
+                ) = pcm.adaptive_stats();
+            }
+            if pcm.is_cancelled() {
+                return Err("Announcement playback was stopped".into());
+            }
+            if pcm.ready() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("Adaptive PCM buffering exceeded MAX_PLAY_SECONDS".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    Ok(Prepared::Pcm(guard.0.take().unwrap(), settings))
 }
 
 async fn cancel_download(pending: &mut Option<JoinHandle<Result<Prepared, String>>>) {
@@ -279,7 +340,7 @@ async fn download(
     settings: Settings,
 ) -> Result<Prepared, String> {
     // Fetch ourselves so redirects, protocol, size, and duration stay bounded.
-    // mpv only sees this private local file, never the signed HA URL or API token.
+    // The native decoder only sees a private file, never a signed HA URL/token.
     let started = Instant::now();
     let endpoint = url.origin().ascii_serialization();
     let mut response = client
