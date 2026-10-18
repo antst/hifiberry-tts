@@ -142,6 +142,9 @@ def exercise(api, node, gains, original, wait_for, tts, wyoming_port, mpd_port, 
     wait_for(lambda: api()["state"] == "idle")
     assert not api()["last_error"], api()
     assert abs(api()["position"] - 2) < .05, api()
+    expected_peak = 20 * math.log10(4000 / 32768) + api()["speech_gain_db"]
+    assert abs(api()["speech_peak_dbfs"] - expected_peak) < .1, api()
+    assert api()["speech_clipped_samples"] == 0, api()
     api("play")  # Direct TTS replay re-synthesizes.
     wait_for(lambda: len(tts.requests) == before + 2)
     api("stop")

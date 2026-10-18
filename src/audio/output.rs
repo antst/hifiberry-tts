@@ -1,4 +1,4 @@
-use super::{Command, Decoder, Pcm, PcmFrame, Shared, Source};
+use super::{Command, Decoder, LevelMeter, Pcm, PcmFrame, Shared, Source};
 use pipewire::{self as pw, properties::properties, spa};
 use std::{
     cell::RefCell,
@@ -135,7 +135,9 @@ pub(super) fn run(
                 } else {
                     session.rate as usize / 100
                 });
-                let volume = f32::from_bits(session.state.volume.load(Ordering::Acquire));
+                let volume = f32::from_bits(session.state.volume.load(Ordering::Acquire))
+                    * session.state.speech_gain;
+                let mut meter = LevelMeter::default();
                 for frame in bytes[..frames * 8].as_chunks_mut::<8>().0 {
                     if session.draining || session.paused {
                         break;
@@ -163,15 +165,12 @@ pub(super) fn run(
                     for (value, destination) in
                         samples.into_iter().zip(frame.as_chunks_mut::<4>().0)
                     {
-                        let value = if value.is_finite() {
-                            (value * volume).clamp(-1.0, 1.0)
-                        } else {
-                            0.0
-                        };
+                        let value = meter.sample(value, volume);
                         destination.copy_from_slice(&value.to_le_bytes());
                     }
                     count += 1;
                 }
+                meter.publish(&session.state);
             }
             *output.chunk_mut().offset_mut() = 0;
             *output.chunk_mut().stride_mut() = 8;

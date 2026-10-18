@@ -39,3 +39,5 @@ The discovery-only regression requires a built bridge and Python 3, with no Pipe
 cargo build --locked
 python3 tests/wyoming_discovery.py target/debug/hifiberry-tts
 ```
+
+Speech-gain tests capture actual null-sink output and compare tone amplitude with `4000 × 10^(speech_gain_db/20)`, while background and master levels remain unchanged. They check boosted direct PCM peaks, overload counters, fresh-item meter reset, lower-volume replay and mute. Run the full smoke test with `SPEECH_GAIN_DB=6` in the isolated container to include overload/mute cases. These are synthetic checks; actual TTS headroom depends on the voice and generated phrase.

@@ -21,6 +21,7 @@ pub struct Config {
     pub pcm_adaptive: bool,
     pub token: String,
     pub defaults: Settings,
+    pub speech_gain_db: f64,
     pub media_hosts: Vec<String>,
     pub max_audio_bytes: u64,
     pub max_play_time: Duration,
@@ -95,6 +96,7 @@ impl Config {
                 value => Some(value.parse().map_err(|_| "Invalid MPD_BIND_ADDR")?),
             },
             token,
+            speech_gain_db: parse_speech_gain(&read("SPEECH_GAIN_DB", "0"))?,
             wyoming_bind: match read("WYOMING_BIND_ADDR", "127.0.0.1:10700").as_str() {
                 "" => None,
                 value => Some(value.parse().map_err(|_| "Invalid WYOMING_BIND_ADDR")?),
@@ -260,6 +262,14 @@ pub fn prepare_text(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+pub fn parse_speech_gain(raw: &str) -> Result<f64, String> {
+    let db: f64 = raw.parse().map_err(|_| "Invalid SPEECH_GAIN_DB")?;
+    if !db.is_finite() || !(-24.0..=24.0).contains(&db) {
+        return Err("SPEECH_GAIN_DB must be finite and between -24 and 24 dB".into());
+    }
+    Ok(db)
+}
+
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
@@ -371,6 +381,16 @@ mod tests {
             "http://ha.local/a#fragment",
         ] {
             assert!(validate_url(raw, &hosts).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn speech_gain_rejects_invalid_or_excessive_values() {
+        for db in ["-24", "0", "6", "24"] {
+            assert_eq!(parse_speech_gain(db).unwrap(), db.parse::<f64>().unwrap());
+        }
+        for invalid in ["NaN", "inf", "-inf", "24.1", "-24.1", "bad"] {
+            assert!(parse_speech_gain(invalid).is_err(), "{invalid}");
         }
     }
 

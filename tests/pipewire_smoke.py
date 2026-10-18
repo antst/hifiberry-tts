@@ -45,8 +45,8 @@ def unused_port():
         return sock.getsockname()[1]
 
 
-def tone(path, frequency, seconds):
-    samples = array.array("h", (int(4000 * math.sin(2 * math.pi * frequency * i / 48000)) for i in range(int(seconds * 48000)) for _ in range(2)))
+def tone(path, frequency, seconds, amplitude=4000):
+    samples = array.array("h", (int(amplitude * math.sin(2 * math.pi * frequency * i / 48000)) for i in range(int(seconds * 48000)) for _ in range(2)))
     with wave.open(str(path), "wb") as output:
         output.setparams((2, 2, 48000, 0, "NONE", "not compressed"))
         output.writeframes(samples.tobytes())
@@ -109,6 +109,7 @@ def main():
             tone(root / "background.wav", 220, 2)
             tone(root / "background2.wav", 330, 2)
             tone(root / "speech.wav", 880, 2)
+            tone(root / "hot.wav", 880, 1, amplitude=24000)
 
             class Handler(http.server.BaseHTTPRequestHandler):
                 hits = 0
@@ -123,7 +124,7 @@ def main():
                         self.send_header("Content-Length", "99999999")
                         self.end_headers()
                         return
-                    data = (Path(__file__).parent / "fixtures/tone.mp3").read_bytes() if self.path == "/speech.mp3" else (root / "speech.wav").read_bytes()
+                    data = (Path(__file__).parent / "fixtures/tone.mp3").read_bytes() if self.path == "/speech.mp3" else (root / ("hot.wav" if self.path == "/hot.wav" else "speech.wav")).read_bytes()
                     self.send_response(200)
                     self.send_header("Content-Type", "audio/wav")
                     self.send_header("Content-Length", str(len(data)))
@@ -193,6 +194,12 @@ def main():
             speech_during = level(speech_start + .5, 880)
             assert baseline > 100 and speech_during > 100, (baseline, background_during, speech_during)
             assert .15 < background_during / baseline < .35, (baseline, background_during)
+            gain_db = api()["speech_gain_db"]
+            expected = 4000 * 10 ** (gain_db / 20)
+            assert abs(speech_during / expected - 1) < .03, (speech_during, expected)
+            expected_peak = 20 * math.log10(4000 / 32768) + gain_db
+            assert abs(api()["speech_peak_dbfs"] - expected_peak) < .1, api()
+            assert api()["speech_clipped_samples"] == 0, api()
             print(f"Captured audio: background ratio={background_during / baseline:.3f}, TTS amplitude={speech_during:.1f}; master unchanged", flush=True)
 
             # media_play uses the private cache; no second HTTP download.
@@ -283,6 +290,23 @@ def main():
             wait_for(lambda: api()["state"] == "idle")
             assert not api()["last_error"],api()
             print("PASS: native MP3 decoding and output drain",flush=True)
+            if gain_db >= 6:
+                api("volume", {"volume_level":1.0})
+                api("play_media", {"url":audio_url.rsplit("/",1)[0]+"/hot.wav"})
+                wait_for(lambda: api()["state"] == "playing")
+                wait_for(lambda: api()["state"] == "idle")
+                assert api()["speech_peak_dbfs"] > 0 and api()["speech_clipped_samples"] > 0, api()
+                api("volume", {"volume_level":.25})
+                api("play")
+                wait_for(lambda: api()["state"] == "playing")
+                wait_for(lambda: api()["state"] == "idle")
+                assert api()["speech_clipped_samples"] == 0 and api()["speech_peak_dbfs"] < 0, api()
+                api("volume", {"volume_level":0})
+                api("play")
+                wait_for(lambda: api()["state"] == "playing")
+                wait_for(lambda: api()["state"] == "idle")
+                assert api()["speech_peak_dbfs"] is None and api()["speech_clipped_samples"] == 0, api()
+                print("PASS: boosted overload is metered; lower volume retains preamp and clears clipping on replay; mute stays silent",flush=True)
             tts.shutdown()
         except BaseException:
             log.flush()

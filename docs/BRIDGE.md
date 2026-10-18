@@ -42,7 +42,8 @@ systemctl --user restart hifiberry-tts
 | `TTS_VOICE` | Empty | Default **advertised Wyoming voice ID** for MPD text. |
 | `DUCK_TARGETS` | `*` | Current running playback source streams, or exact process names separated by commas. |
 | `DUCK_FACTOR` | `0.25` | Multiplier of background linear amplitude; about −12 dB. `1` disables ducking. |
-| `TTS_VOLUME_LEVEL` | `1.0` | Initial speech amplitude, 0–1; 1 is unity, no preamp/normalization. |
+| `TTS_VOLUME_LEVEL` | `1.0` | Initial speech volume, 0–1, before the separate speech gain. |
+| `SPEECH_GAIN_DB` | `0` | Bridge 0.6.0+: output preamp, -24 to +24 dB. +6 is approximately twice the amplitude. Applies to direct TTS, satellite PCM and URL playback. |
 | `PCM_BUFFERING_MODE` | `fixed` | `fixed` uses a bounded live queue; `adaptive` estimates arrival speed and can wait for completion. See below. |
 | `PCM_PREBUFFER_MS` | `250` | Audio accumulated before startup/recovery. Adaptive mode may increase this target or wait for completion. |
 | `PCM_BUFFER_MS` | `1000` | 10–5000 ms, at least the prebuffer. Fixed mode: queue cap/backpressure. Adaptive mode: decoded read-ahead cap; raw PCM receive memory is bounded separately. |
@@ -56,6 +57,14 @@ systemctl --user restart hifiberry-tts
 The supplied install example binds listeners to LAN interfaces. HTTP/MPD use the token, but plain HTTP and MPD do not encrypt it. Wyoming has no authentication/encryption. Use a trusted LAN or restrict access to HA. HiFiBerry's nginx authentication does not protect these separate listeners.
 
 HTTP downloads have a 5-second connection timeout, a configurable 120-second total timeout and no redirects. Earlier versions used a hardcoded 20-second total limit, which could expire while HA was still generating speech. Self-signed/private-CA HTTPS needs appropriate trust/proxy support; this build uses public certificate roots. `FORCE_PROTO=http` is an explicit scheme override, not an automatic TLS downgrade.
+
+## Speech gain
+
+HA volume and `/v1/volume` remain 0–1. Set `SPEECH_GAIN_DB=6` in the bridge environment for approximately twice the speech amplitude, then restart its user service. The default is 0 dB, so an upgrade alone preserves levels. Valid gain is -24 to +24 dB. Effective amplitude is `volume_level × 10^(SPEECH_GAIN_DB / 20)`; muting remains zero regardless of gain. This changes samples only in the bridge's own output stream and covers URL files, MPD, direct text and satellite PCM. The optional synthesis proxy continues returning unmodified PCM.
+
+Status reports `speech_gain_db`, `speech_peak_dbfs` and `speech_clipped_samples`. Peaks are measured after volume/gain but before saturation; values above 0 dBFS indicate overload. Silence reports a null peak. Clipped samples count individual channel samples outside full scale before saturation. Peak/counter readings reset for a new playback item, accumulate through pause/resume/volume changes, and remain available after finish/cancel. The HA component 0.6.0+ exposes them as player attributes; older components still control volume normally.
+
+Boost consumes existing headroom. Output remains bounded to ±1; this is saturation, not a dynamic limiter or normalization. Lower the gain if clipped samples appear. These measurements cover speech samples at the bridge output, not subsequent EQ or the combined music/speech mix. No extra buffering or lookahead is introduced.
 
 ## Adaptive PCM buffering
 
@@ -108,7 +117,7 @@ These are this project's endpoints, not pre-existing HiFiBerry APIs. All require
 
 | Method / path | Body / purpose |
 | --- | --- |
-| `GET /v1/status` | Playback/error state, speech gain/position/duration, ducking warnings, queued PCM and underruns. |
+| `GET /v1/status` | Playback/error state, speech volume/gain, peak and clipping counters, position/duration, ducking warnings, queued PCM and underruns. |
 | `POST /v1/play_media` | `url`; optional `volume_level`, `duck_factor`, `duck_targets`. |
 | `POST /v1/speak` | `text`; optional `voice`, `language`, `speaker`, `server` (Wyoming host:port). |
 | `POST /v1/play` | Resume/replay a file or re-synthesize the last direct request. |

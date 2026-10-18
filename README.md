@@ -55,17 +55,20 @@ In bridge **0.3.1**, direct mode first checks the server's `describe`/`info` res
 
 See [install, environment and API instructions](docs/BRIDGE.md). Release assets include a Linux ARM64 executable; source is under `src/`. The service uses native PipeWire and Symphonia, with no mpv process. It follows NG's existing default output/EQ path. It adds only its own binary, user unit and environment file.
 
-The HA player's volume controls **speech only** at 0–100% amplitude. Background selection and reduction live in the Pi environment:
+The HA player's volume controls **speech only** at 0–100%. Bridge 0.6.0+ adds an independent `SPEECH_GAIN_DB` preamp: `0` preserves amplitude, `6` is approximately twice the amplitude. It applies to all bridge playback, including direct TTS, satellite PCM and URLs, while HA's slider remains 0–1. Background selection, reduction and speech gain live in the Pi environment:
 
 ```ini
 DUCK_TARGETS=*
 DUCK_FACTOR=0.25
 TTS_VOLUME_LEVEL=1.0
+SPEECH_GAIN_DB=6
 PCM_PREBUFFER_MS=250
 PCM_BUFFER_MS=1000
 # Optional for bursty/slow live PCM:
 PCM_BUFFERING_MODE=adaptive
 ```
+
+`SPEECH_GAIN_DB` defaults to `0` and accepts -24 to +24 dB. The effective amplitude is `volume_level × 10^(SPEECH_GAIN_DB / 20)`. Mute still produces silence. Status exposes `speech_peak_dbfs` before output saturation and `speech_clipped_samples` for the current/last item; nonzero clipping means the boost exceeded available headroom. Samples remain bounded to full scale. No normalization, dynamic limiter or extra audio buffer is added. The shared master volume remains in effect.
 
 `DUCK_TARGETS=*` selects current running source streams; a comma-separated list selects process names. Shared EQ/RIAA and sink/master controls are excluded. New streams appearing after speech starts are not automatically ducked. A hard crash can leave an attenuated stream; graceful stop/restart restores gains while preserving intervening user changes.
 

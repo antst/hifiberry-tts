@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut s = status.write().await;
         s.volume_level = config.defaults.volume_level;
+        s.speech_gain_db = config.speech_gain_db;
         s.pcm_prebuffer_ms = config.pcm_prebuffer_ms;
         s.pcm_buffering_mode = if config.pcm_adaptive {
             "adaptive"
@@ -261,6 +262,7 @@ mod tests {
                     bind: "127.0.0.1:0".parse().unwrap(),
                     mpd_bind: None,
                     token: "test-token-at-least-24-characters".into(),
+                    speech_gain_db: 0.0,
                     defaults: Settings {
                         volume_level: 0.7,
                         duck_factor: 0.25,

@@ -433,10 +433,47 @@ pub struct Shared {
     pub finished: AtomicBool,
     pub buffering: AtomicBool,
     pub volume: AtomicU32,
+    pub speech_gain: f32,
+    pub peak: AtomicU32,
+    pub clipped_samples: AtomicU64,
     pub position: AtomicU64,
     pub duration: AtomicU64,
     pub error: Mutex<Option<String>>,
 }
+impl Shared {
+    pub fn levels(&self) -> (Option<f64>, u64) {
+        let peak = f32::from_bits(self.peak.load(Ordering::Relaxed));
+        (
+            (peak > 0.0).then(|| 20.0 * f64::from(peak).log10()),
+            self.clipped_samples.load(Ordering::Relaxed),
+        )
+    }
+}
+
+// Local to each output callback; publish atomics once per buffer, not per sample.
+#[derive(Default)]
+pub(super) struct LevelMeter {
+    peak: f32,
+    clipped: u64,
+}
+impl LevelMeter {
+    pub fn sample(&mut self, sample: f32, level: f32) -> f32 {
+        if !sample.is_finite() {
+            return 0.0;
+        }
+        let scaled = sample * level;
+        self.peak = self.peak.max(scaled.abs().min(f32::MAX));
+        self.clipped += u64::from(scaled.abs() > 1.0);
+        scaled.clamp(-1.0, 1.0)
+    }
+    pub fn publish(&self, state: &Shared) {
+        state.peak.fetch_max(self.peak.to_bits(), Ordering::Relaxed);
+        state
+            .clipped_samples
+            .fetch_add(self.clipped, Ordering::Relaxed);
+    }
+}
+
 pub struct Output {
     pub shared: Arc<Shared>,
     sender: mpsc::Sender<Command>,
@@ -444,13 +481,21 @@ pub struct Output {
     pcm: Option<Arc<Pcm>>,
 }
 impl Output {
-    pub fn open(source: Source, volume: f64, target: Option<String>) -> Result<Self, String> {
+    pub fn open(
+        source: Source,
+        volume: f64,
+        speech_gain_db: f64,
+        target: Option<String>,
+    ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         let shared = Arc::new(Shared {
             started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             buffering: AtomicBool::new(true),
             volume: AtomicU32::new((volume as f32).to_bits()),
+            speech_gain: 10.0_f64.powf(speech_gain_db / 20.0) as f32,
+            peak: AtomicU32::new(0.0_f32.to_bits()),
+            clipped_samples: AtomicU64::new(0),
             position: AtomicU64::new(0.0_f64.to_bits()),
             duration: AtomicU64::new(f64::NAN.to_bits()),
             error: Mutex::new(None),
@@ -599,6 +644,33 @@ mod tests {
         assert_eq!(decoder.next().unwrap(), Some([0.5, 0.5]));
         assert_eq!(decoder.next().unwrap(), Some([-0.25, -0.25]));
         assert_eq!(decoder.next().unwrap(), None);
+    }
+
+    #[test]
+    fn speech_boost_preserves_volume_and_mute_without_changing_quiet_samples() {
+        let mut meter = LevelMeter::default();
+        let gain = 10.0_f32.powf(6.0 / 20.0);
+        assert_eq!(meter.sample(0.25, 1.0), 0.25);
+        assert!((meter.sample(0.25, gain) - 0.4988156).abs() < 0.000001);
+        assert!((meter.sample(0.25, gain * 0.5) - 0.2494078).abs() < 0.000001);
+        assert_eq!(meter.sample(0.75, 0.0), 0.0);
+        assert_eq!(meter.clipped, 0);
+    }
+
+    #[test]
+    fn speech_meter_reports_overload_before_saturation_and_ignores_invalid_input() {
+        let mut meter = LevelMeter::default();
+        assert_eq!(meter.sample(0.75, 2.0), 1.0);
+        assert_eq!(meter.sample(-0.8, 2.0), -1.0);
+        assert_eq!(meter.peak, 1.6);
+        assert_eq!(meter.clipped, 2);
+        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(meter.sample(sample, 2.0), 0.0);
+        }
+        assert_eq!(meter.clipped, 2);
+        assert_eq!(meter.sample(f32::MAX, 2.0), 1.0);
+        assert_eq!(meter.peak, f32::MAX);
+        assert_eq!(meter.clipped, 3);
     }
 
     #[tokio::test]

@@ -30,6 +30,9 @@ pub struct Status {
     pub last_error: Option<String>,
     pub duck_warning: Option<String>,
     pub volume_level: f64,
+    pub speech_gain_db: f64,
+    pub speech_peak_dbfs: Option<f64>,
+    pub speech_clipped_samples: u64,
     pub position: f64,
     pub duration: Option<f64>,
     pub pcm_buffered_ms: u64,
@@ -57,6 +60,9 @@ impl Default for Status {
             last_error: None,
             duck_warning: None,
             volume_level: 1.0,
+            speech_gain_db: 0.0,
+            speech_peak_dbfs: None,
+            speech_clipped_samples: 0,
             position: 0.0,
             duration: None,
             pcm_buffered_ms: 0,
@@ -288,6 +294,7 @@ pub async fn run(
                     }
                 } else if let Some(player) = running.as_mut() {
                     let mut s = status.write().await;
+                    (s.speech_peak_dbfs, s.speech_clipped_samples) = player.output.shared.levels();
                     s.position = player.output.position();
                     s.duration = player.output.duration();
                     (s.pcm_buffered_ms, s.pcm_underruns) = player.output.metrics();
@@ -508,7 +515,12 @@ async fn start_source(
         duck.count(),
         started.elapsed().as_millis()
     );
-    match Output::open(source, settings.volume_level, config.audio_device.clone()) {
+    match Output::open(
+        source,
+        settings.volume_level,
+        config.speech_gain_db,
+        config.audio_device.clone(),
+    ) {
         Ok(output) => {
             let mut s = status.write().await;
             s.state = "buffering";
@@ -521,6 +533,8 @@ async fn start_source(
             s.duration = None;
             s.pcm_buffered_ms = 0;
             s.pcm_underruns = 0;
+            s.speech_peak_dbfs = None;
+            s.speech_clipped_samples = 0;
             *running = Some(Running {
                 output,
                 duck,
@@ -561,9 +575,11 @@ async fn resume(
 
 async fn finish(config: &Config, status: &RwLock<Status>, running: &mut Option<Running>) {
     if let Some(player) = running.take() {
+        let meters = player.output.shared.clone();
         player.output.stop().await;
         let messages = player.duck.restore(config).await;
         let mut s = status.write().await;
+        (s.speech_peak_dbfs, s.speech_clipped_samples) = meters.levels();
         s.ducked_streams = 0;
         s.duck_warning = warnings(&messages);
         s.pcm_buffered_ms = 0;
